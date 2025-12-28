@@ -1375,8 +1375,8 @@ static void handleStlViewJs(){
       if(!drag) return;
       const dx=e.clientX-lx, dy=e.clientY-ly;
       lx=e.clientX; ly=e.clientY;
-      yaw   += dx * 0.007;
-      pitch += dy * 0.007;
+      yaw -= dx * 0.007;
+    pitch -= dy * 0.007;
       pitch = clamp(pitch, -1.45, 1.45);
     });
     canvas.addEventListener("wheel", (e)=>{
@@ -1879,7 +1879,7 @@ static void handleThumb(){
       return;
     }
     thumbgenEnqueue(filePath);
-    server.send(200, "text/plain", "queued");
+    server.send(200, "application/json", "{\"queued\":true}");
     return;
   }
 
@@ -1962,7 +1962,7 @@ static void handleView(){
          "<div>"
          "<a class='btn' href='/download?name="+urlEncode(n)+"'>Download CTB</a> ";
     if (!usbExclusiveMode()){
-      s += "<a class='btn blue' href='/thumb?q=1&name="+urlEncode(n)+"'>Rebuild Thumb</a>";
+      s += "<button class='btn blue' type='button' onclick='rebuildThumb(\""+urlEncode(n)+"\",\""+urlEncode(thumb)+"\")'>Rebuild Thumb</button>";
     } else {
       s += "<span class='chip'>Read-only</span>";
     }

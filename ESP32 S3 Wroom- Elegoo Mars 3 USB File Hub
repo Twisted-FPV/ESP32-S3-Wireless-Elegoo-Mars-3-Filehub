@@ -1,0 +1,2629 @@
+// ESP32-S3 STL/CTB FileHub — single .ino, UTF-8 safe, special-char filenames fixed
+// + USB MSC (PC sees SD as a USB drive)
+// + Separate folders for STL + CTB: /stl and /ctb
+// + Thumbnails stored in: /thumbs/stl and /thumbs/ctb (hashed from full canonical path so STL/CTB never collide)
+//
+// Includes:
+// - Interactive STL Preview (/view) with self-hosted /stlview.js (no CDN)
+// - CTB Preview page (/view) that shows thumbnail + actions
+// - Preview button is present in the file list
+// - Web button to toggle USB “presented to PC” vs “web-safe RW mode”
+//   * USB PRESENTED  => web becomes READ-ONLY (safe while PC may access SD)
+//   * WEB-SAFE MODE  => USB media is NOT presented (web can upload/delete/thumbgen)
+//
+// IMPORTANT (about your earlier compile error):
+// Arduino .ino auto-prototyper can insert prototypes before types exist.
+// This file keeps ALL structs/types declared before any function definitions in this .ino!
+//
+// Target: ESP32-S3 N16R8 (16MB Flash / 8MB PSRAM)
+// SD (SPI) pins:
+//   CS/SS = GPIO10, MOSI=GPIO11, MISO=GPIO13, SCK=GPIO12
+//
+// SD Folders: /stl, /ctb, /thumbs/stl, /thumbs/ctb
+
+// ---- Forward declarations to satisfy Arduino auto-prototypes ----
+struct CTBV5HeaderLite;
+struct CTBV5PreviewRec;
+struct CTBPreviewCand;
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+#include <SPI.h>
+#include <FS.h>
+#include <SD.h>
+
+#include <vector>
+#include <algorithm>
+#include <ctype.h>
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+#include <USB.h>
+#include <USBMSC.h>
+
+#if ARDUINO_ARCH_ESP32
+  #include "esp_heap_caps.h"
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ===== Pins & Wi-Fi =====
+#define SD_CS   10
+#define SD_SCK  12
+#define SD_MOSI 11
+#define SD_MISO 13
+
+const char* WIFI_SSID = "Platform 9 3/4";
+const char* WIFI_PASS = "Screamforpassword123";
+const bool  ENABLE_AP_FALLBACK = true;
+const char* AP_SSID   = "S3_FileHub";
+const char* AP_PASS   = "12345678";
+
+static const bool START_USB_PRESENTED = false;  // false = Web-safe RW by default
+
+// Optionally wipe thumbs on boot (off by default)
+static const bool REBUILD_THUMBS_ON_BOOT = false;
+
+// ===== Mars Remote (UART) =====
+// NOTE: Elegoo Mars 3 support is [Unverified]. Many ChiTu-based printers expose a TTL UART on the mainboard.
+// Wire ESP32-S3 GND <-> printer GND, ESP32 TX -> printer RX, ESP32 RX <- printer TX.
+// Default pins below are placeholders; set these to your wiring.
+#ifndef MARS_UART_TX
+#define MARS_UART_TX 17
+#endif
+#ifndef MARS_UART_RX
+#define MARS_UART_RX 18
+#endif
+#ifndef MARS_UART_BAUD
+#define MARS_UART_BAUD 115200
+#endif
+
+static HardwareSerial& MarsSerial = Serial1;
+static bool   g_marsEnabled = false;
+static String g_marsLastCmd = "";
+static String g_marsLastResp = "";
+static uint32_t g_marsLastMs = 0;
+
+
+
+// ===== Paths =====
+static const char* STL_DIR     = "/stl";
+static const char* CTB_DIR     = "/ctb";
+static const char* TH_ROOT_DIR = "/thumbs";
+static const char* TH_STL_DIR  = "/thumbs/stl";
+static const char* TH_CTB_DIR  = "/thumbs/ctb";
+
+// ===== Printer-visible folder (optional mirror for printers that only browse a specific folder) =====
+static const char* PRINTER_DIR = "/printer";
+
+
+// ===== USB MSC =====
+static USBMSC MSC;
+static volatile bool g_usbAttached = false;
+static volatile bool g_usbMounted  = false;     // host is actively mounting / doing I/O (best-effort)
+static volatile bool g_mscPresented = START_USB_PRESENTED;
+
+// ===== Web server =====
+WebServer server(80);
+
+// ===== Types (MUST be before any function definitions in .ino!) =====
+struct Item {
+  String name, path;
+  bool isDir;
+  uint64_t size;
+  uint32_t pseudoTime;
+};
+
+struct Vec3 { float x, y, z; };
+
+// ===== Thumbnail image buffers (160x120), depth as uint16 =====
+static const int TH_W = 160, TH_H = 120;
+
+struct ImgBuf {
+  uint8_t  rgba[TH_W * TH_H * 4];
+  uint16_t zbuf[TH_W * TH_H];
+
+  static inline uint16_t dz(float z){
+    float t = (z + 2.0f) * 0.25f;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return (uint16_t)(t * 65535.0f + 0.5f);
+  }
+  void clear(uint8_t r = 235, uint8_t g = 238, uint8_t b = 245, uint8_t a = 255){
+    for (int i = 0; i < TH_W * TH_H; i++){
+      rgba[i*4 + 0] = r; rgba[i*4 + 1] = g; rgba[i*4 + 2] = b; rgba[i*4 + 3] = a;
+      zbuf[i] = 0xFFFF;
+    }
+  }
+  inline void setRGBA(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a, float z){
+    if ((unsigned)x >= TH_W || (unsigned)y >= TH_H) return;
+    int idx = y * TH_W + x;
+    uint16_t zz = dz(z);
+    if (zz < zbuf[idx]){
+      zbuf[idx] = zz;
+      rgba[idx*4 + 0] = r; rgba[idx*4 + 1] = g; rgba[idx*4 + 2] = b; rgba[idx*4 + 3] = a;
+    }
+  }
+};
+
+// ===== PNG CRC + Writer =====
+struct PNGCrc{
+  uint32_t crc=0xFFFFFFFFu;
+  static inline uint32_t upd(uint32_t c,uint8_t b){
+    c^=b;
+    for(int i=0;i<8;i++) c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1);
+    return c;
+  }
+  void feedByte(uint8_t b){ crc=upd(crc,b); }
+  void feed(const uint8_t* p,size_t n){ for(size_t i=0;i<n;i++) feedByte(p[i]); }
+  uint32_t get(){ return ~crc; }
+};
+
+// ===== Globals =====
+static ImgBuf g_img;
+
+// ===== Live progress for UI polling =====
+static volatile bool g_busy=false;
+static volatile int  g_prog=0;
+static String g_task="", g_file="", g_statusLine="";
+
+// ===== Queue =====
+static const int QMAX=128;
+static String qitems[QMAX];
+static int qhead=0,qtail=0;
+static volatile bool g_qbusy=false;
+
+// ===== Forward declarations (avoid Arduino auto-prototype issues) =====
+static inline bool usbExclusiveMode();
+static inline void heartbeat();
+
+static void ensureDir(const char* d);
+static void ensureThumbDirs();
+static String sanitizeDir(String dir);
+
+static bool hasSTLExt(const String& n);
+static bool hasCTBExt(const String& n);
+static bool isSupportedFile(const String& n);
+
+// Thumb path helpers (NEW: compat)
+static String pngForNew(const String& filePath);     // hashing is case-insensitive (lowercase canonical)
+static String pngForOld(const String& filePath);     // legacy hashing (case-sensitive canonical)
+static String pngForExistingOrNew(const String& filePath); // if old exists use it, else new
+static void   deleteThumbForFileBoth(const String& filePath);
+
+static void qEnqueue(const String& p);
+// Compatibility alias: older code referred to thumbgenEnqueue()
+static inline void thumbgenEnqueue(const String& p) { qEnqueue(p); }
+
+static bool generateThumbAny(const String& filePath);
+static void scanDirAndQueueMissing(const String& dir);
+
+static String ensureAllowedFilePathFromArg(const String& argName);
+
+static void handleRoot();
+static void handleFile();
+static void handleDownload();
+static void handleDelete();
+static void handleDeleteMulti();
+static void handleUploadDone();
+static void handleFileUpload();
+static void handleQState();
+
+static void handleUsbToggle();
+
+static void handleView();
+static void handleStlViewJs();
+
+static bool setupWiFi();
+static bool setupUSBMSC();
+
+static void setUsbPresented(bool present);
+
+static void handleThumb();
+static void handlePrinter();
+static void handlePrinterSend();
+static void handlePrinterRescan();
+
+
+static void handleMars();
+static void handleMarsSend();
+static void handleMarsStatus();
+
+
+// ============================================================
+//                 CTB PREVIEW DECODER (ROBUST)
+//   Scans for any plausible preview struct: (w,h,off,len)
+//   Tries candidates until one decodes enough pixels.
+// ============================================================
+
+
+// CTB preview encoding kind (for future extension)
+enum class CTBPreviewKind : uint8_t {
+  UNKNOWN = 0,
+  RGB15_RLE = 1,
+};
+
+struct CTBPreviewCand {
+  CTBPreviewKind kind = CTBPreviewKind::UNKNOWN;
+  uint32_t w=0, h=0;
+  uint32_t imageOffset=0;
+  uint32_t imageLength=0;
+  uint32_t structOffset=0;
+};
+
+// ---------------- CTB v5 (Chitubox v1.0.1) deterministic preview parsing ----------------
+//
+// Some CTB files include two previews stored immediately after the settings block.
+// UVtools and many encoders place the previews starting at (SettingsOffset + SettingsSize).
+// We prefer the exact 400x300 "small" preview when present.
+//
+// This parser reads the CTB header fields needed to locate that preview and returns
+// the image payload offset/length for the 400x300 preview (RGB15 RLE).
+
+struct CTBV5HeaderLite {
+  uint32_t magic;
+  uint32_t settingsSize;
+  uint32_t settingsOffset;
+  uint32_t unknown1;
+  uint32_t version;
+  uint32_t signatureSize;
+  uint32_t signatureOffset;
+  uint32_t unknown;
+  uint16_t unknown4;
+  uint16_t unknown5;
+  uint32_t unknown6;
+  uint32_t unknown7;
+  uint32_t unknown8;
+};
+
+struct CTBV5PreviewRec {
+  uint32_t w;
+  uint32_t h;
+  uint32_t imageOffset; // absolute
+  uint32_t imageLength; // bytes
+};
+
+static uint32_t readU32LE_File(File &f) {
+  uint8_t b[4];
+  if (f.read(b, 4) != 4) return 0;
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static uint16_t readU16LE_File(File &f) {
+  uint8_t b[2];
+  if (f.read(b, 2) != 2) return 0;
+  return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+
+static bool ctbReadV5HeaderLite(File &f, CTBV5HeaderLite &h) {
+  if (!f.seek(0)) return false;
+  h.magic           = readU32LE_File(f);
+  h.settingsSize    = readU32LE_File(f);
+  h.settingsOffset  = readU32LE_File(f);
+  h.unknown1        = readU32LE_File(f);
+  h.version         = readU32LE_File(f);
+  h.signatureSize   = readU32LE_File(f);
+  h.signatureOffset = readU32LE_File(f);
+  h.unknown         = readU32LE_File(f);
+  h.unknown4        = readU16LE_File(f);
+  h.unknown5        = readU16LE_File(f);
+  h.unknown6        = readU32LE_File(f);
+  h.unknown7        = readU32LE_File(f);
+  h.unknown8        = readU32LE_File(f);
+  return true;
+}
+
+static bool ctbReadV5PreviewRec(File &f, uint32_t offset, CTBV5PreviewRec &p) {
+  if (!f.seek(offset)) return false;
+  p.w = readU32LE_File(f);
+  p.h = readU32LE_File(f);
+  p.imageOffset = readU32LE_File(f);
+  p.imageLength = readU32LE_File(f);
+  if (p.w == 0 || p.h == 0 || p.imageLength == 0) return false;
+  uint32_t sz = (uint32_t)f.size();
+  if (p.imageOffset > sz) return false;
+  if (p.imageOffset + p.imageLength > sz) return false;
+  return true;
+}
+
+// Returns true if a 400x300 preview is found using the CTB v5 deterministic layout.
+// If false, caller can fall back to heuristic scanning.
+static bool ctbTryGetV5SmallPreview(File &f, uint32_t &w, uint32_t &h, uint32_t &imgOff, uint32_t &imgLen) {
+  CTBV5HeaderLite hdr{};
+  if (!ctbReadV5HeaderLite(f, hdr)) return false;
+
+  // Previews start right after the settings block.
+  uint32_t previewsStart = hdr.settingsOffset + hdr.settingsSize;
+  if (previewsStart < 32 || previewsStart >= (uint32_t)f.size()) return false;
+
+  CTBV5PreviewRec p0{}, p1{};
+  if (!ctbReadV5PreviewRec(f, previewsStart, p0)) return false;
+
+  // Next preview record is: 16 bytes record + payload bytes
+  uint32_t p1off = previewsStart + 16u + p0.imageLength;
+  if (!ctbReadV5PreviewRec(f, p1off, p1)) return false;
+
+  const bool p0small = (p0.w == 400u && p0.h == 300u);
+  const bool p1small = (p1.w == 400u && p1.h == 300u);
+
+  if (p0small) { w = p0.w; h = p0.h; imgOff = p0.imageOffset; imgLen = p0.imageLength; return true; }
+  if (p1small) { w = p1.w; h = p1.h; imgOff = p1.imageOffset; imgLen = p1.imageLength; return true; }
+
+  return false;
+}
+
+
+static uint32_t readU32LE(const uint8_t* p){
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Collect candidates where memory at [i..i+15] looks like:
+//   u32 w, u32 h, u32 imageOffset, u32 imageLength
+static void ctbCollectPreviewCandidates(fs::File& f, std::vector<CTBPreviewCand>& out){
+  out.clear();
+  if(!f) return;
+
+  const uint64_t fsz = f.size();
+  if (fsz < 64) return;
+
+  // Scan up to 8MB (or whole file if smaller).
+  uint64_t scanMax = fsz;
+  const uint64_t LIMIT = (uint64_t)8 * 1024 * 1024;
+  if (scanMax > LIMIT) scanMax = LIMIT;
+
+  const size_t CHUNK = 4096;
+  std::vector<uint8_t> buf(CHUNK + 32);
+  uint64_t pos = 0;
+  size_t carry = 0;
+
+  auto plausibleDims = [](uint32_t w, uint32_t h)->bool{
+    if (w < 32 || h < 32) return false;
+    if (w > 2048 || h > 2048) return false;
+    uint64_t px = (uint64_t)w * (uint64_t)h;
+    if (px < 5000) return false;
+    if (px > 3000000ULL) return false;
+    return true;
+  };
+
+  while (pos < scanMax){
+    size_t toRead = (size_t)min<uint64_t>(CHUNK, scanMax - pos);
+    f.seek(pos);
+    size_t got = f.read(buf.data() + carry, toRead);
+    size_t n = carry + got;
+    if (n < 16) break;
+
+    for (size_t i=0; i + 16 <= n; i++){
+      uint32_t w = readU32LE(&buf[i]);
+      uint32_t h = readU32LE(&buf[i+4]);
+      if (!plausibleDims(w,h)) continue;
+
+      uint32_t off = readU32LE(&buf[i+8]);
+      uint32_t len = readU32LE(&buf[i+12]);
+
+      if (off == 0 || len == 0) continue;
+      if ((uint64_t)off + (uint64_t)len > fsz) continue;
+      if (len < 16 || len > (uint32_t)(16 * 1024 * 1024)) continue;
+
+      CTBPreviewCand c;
+      c.w = w; c.h = h;
+      c.imageOffset = off;
+      c.imageLength = len;
+      c.structOffset = (uint32_t)(pos + i);
+      out.push_back(c);
+    }
+
+    // overlap
+    size_t keep = min<size_t>(24, n);
+    memmove(buf.data(), buf.data() + (n - keep), keep);
+    carry = keep;
+    pos += got;
+
+    heartbeat();
+  }
+}
+
+// Decode CTB preview RLE RGB15 -> RGB565.
+// Returns number of pixels written (0 = failure).
+static uint32_t ctbDecodeRGB15RLE_toRGB565(fs::File& f, uint32_t imgOff, uint32_t imgLen, uint16_t* dst, uint32_t dstPixels){
+  if(!f || !dst || dstPixels == 0) return 0;
+  if (imgLen < 4) return 0;
+
+  std::vector<uint8_t> rle;
+  rle.resize(imgLen);
+
+  f.seek(imgOff);
+  size_t got = f.read(rle.data(), imgLen);
+  if (got != imgLen) return 0;
+
+  const uint16_t REPEATRGB15MASK = 0x20;
+  uint32_t pix = 0;
+
+  for (uint32_t i=0; i + 1 < imgLen; i++){
+    uint16_t dot = (uint16_t)rle[i] | ((uint16_t)rle[++i] << 8);
+
+    uint8_t red   = (uint8_t)(((dot >> 11) & 0x1F) << 3);
+    uint8_t green = (uint8_t)(((dot >>  6) & 0x1F) << 3);
+    uint8_t blue  = (uint8_t)(( dot        & 0x1F) << 3);
+
+    uint32_t repeat = 1;
+    if ((dot & REPEATRGB15MASK) == REPEATRGB15MASK){
+      if (i + 2 >= imgLen) break;
+      uint8_t b0 = rle[++i];
+      uint8_t b1 = rle[++i];
+      repeat += (uint32_t)(b0 & 0xFF) | ((uint32_t)(b1 & 0x0F) << 8);
+    }
+
+    uint16_t r5 = (uint16_t)(red   >> 3);
+    uint16_t g5 = (uint16_t)(green >> 3);
+    uint16_t b5 = (uint16_t)(blue  >> 3);
+    uint16_t g6 = (uint16_t)min<uint16_t>(63, (uint16_t)(g5 << 1));
+    uint16_t px565 = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+
+    while (repeat--){
+      if (pix >= dstPixels) return pix;
+      dst[pix++] = px565;
+    }
+
+    if ((pix & 0x3FFF) == 0) heartbeat();
+  }
+
+  return pix;
+}
+
+// Downscale arbitrary srcW×srcH RGB565 -> 160×120 RGBA (nearest neighbor)
+static void ctbDownscale_toThumbRGBA(const uint16_t* src565, uint32_t srcW, uint32_t srcH, ImgBuf& thumb){
+  thumb.clear(235,238,245,255);
+  if (!src565 || srcW == 0 || srcH == 0) return;
+
+  for (int y=0; y<TH_H; y++){
+    uint32_t sy = (uint32_t)((uint64_t)y * srcH / TH_H);
+    if (sy >= srcH) sy = srcH - 1;
+    for (int x=0; x<TH_W; x++){
+      uint32_t sx = (uint32_t)((uint64_t)x * srcW / TH_W);
+      if (sx >= srcW) sx = srcW - 1;
+
+      uint16_t v = src565[sy * srcW + sx];
+      uint8_t r = (uint8_t)(((v >> 11) & 0x1F) << 3);
+      uint8_t g = (uint8_t)(((v >>  5) & 0x3F) << 2);
+      uint8_t b = (uint8_t)(( v        & 0x1F) << 3);
+
+      int idx = (y * TH_W + x) * 4;
+      thumb.rgba[idx+0] = r;
+      thumb.rgba[idx+1] = g;
+      thumb.rgba[idx+2] = b;
+      thumb.rgba[idx+3] = 255;
+    }
+  }
+}
+
+// ===== Helpers =====
+static inline bool usbExclusiveMode(){
+  return g_mscPresented;
+}
+static inline void setTask(const char* t){ g_task=t; }
+static inline void setProg(int p){ if(p<0)p=0; if(p>100)p=100; g_prog=p; }
+static inline void setStatus(const char* t, const String& f, int p){
+  setTask(t); g_file=f; setProg(p); g_busy=true; g_statusLine=String(t)+": "+f;
+}
+static inline void heartbeat(){
+  server.handleClient();
+  delay(0);
+}
+
+// ===== HTML escaper =====
+static String htmlEscape(const String& s){
+  String o; o.reserve(s.length()*2);
+  for (size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='&') o += F("&amp;");
+    else if(c=='<') o += F("&lt;");
+    else if(c=='>') o += F("&gt;");
+    else if(c=='"') o += F("&quot;");
+    else o += c;
+  }
+  return o;
+}
+
+// ===== Utils =====
+static int ciCmp(const String& A, const String& B){
+  size_t na=A.length(), nb=B.length(), n = (na<nb?na:nb);
+  for(size_t i=0;i<n;i++){
+    char a=tolower((unsigned char)A[i]);
+    char b=tolower((unsigned char)B[i]);
+    if(a<b) return -1;
+    if(a>b) return 1;
+  }
+  if(na<nb) return -1;
+  if(na>nb) return 1;
+  return 0;
+}
+static inline float fmin3(float a,float b,float c){return min(a,min(b,c));}
+static inline float fmax3(float a,float b,float c){return max(a,max(b,c));}
+static inline float edgeFunc(float x0,float y0,float x1,float y1,float x,float y){
+  return (x-x0)*(y1-y0)-(y-y0)*(x1-x0);
+}
+
+static String ensureSlash(const String& n){ return (n.length() && n[0]=='/')? n : ("/"+n); }
+static String joinPath(const String& a,const String& b){ if(a.endsWith("/")) return a + b; return a + "/" + b; }
+
+static inline bool hasExt(const String& n, const char* ext){
+  String lo=n; lo.toLowerCase();
+  return lo.endsWith(ext);
+}
+static bool hasSTLExt(const String& n){ return hasExt(n, ".stl"); }
+static bool hasCTBExt(const String& n){ return hasExt(n, ".ctb"); }
+static bool isSupportedFile(const String& n){ return hasSTLExt(n) || hasCTBExt(n); }
+
+static String baseNameNoExt(const String& p){
+  int s=p.lastIndexOf('/'); int st=(s>=0)?s+1:0;
+  int d=p.lastIndexOf('.'); if(d<st) d=p.length();
+  return p.substring(st,d);
+}
+
+static String humanSize(uint64_t b){
+  char out[40];
+  if(b<1024ULL) sprintf(out,"%llu B",(unsigned long long)b);
+  else if(b<1048576ULL) sprintf(out,"%.2f KB", b/1024.0);
+  else if(b<1073741824ULL) sprintf(out,"%.2f MB", b/1048576.0);
+  else sprintf(out,"%.2f GB", b/1073741824.0);
+  return String(out);
+}
+
+
+// ===== Simple file copy for "send to printer" mirror folder =====
+static bool copyFileBuffered(const String& srcPath, const String& dstPath){
+  if (!SD.exists(srcPath)) return false;
+  fs::File in = SD.open(srcPath, FILE_READ);
+  if (!in) return false;
+
+  // Remove destination if it exists
+  if (SD.exists(dstPath)) SD.remove(dstPath);
+  fs::File out = SD.open(dstPath, FILE_WRITE);
+  if (!out){ in.close(); return false; }
+
+  static uint8_t buf[4096];
+  while (true){
+    int n = in.read(buf, sizeof(buf));
+    if (n < 0){ out.close(); in.close(); SD.remove(dstPath); return false; }
+    if (n == 0) break;
+    if ((int)out.write(buf, (size_t)n) != n){ out.close(); in.close(); SD.remove(dstPath); return false; }
+    heartbeat();
+  }
+
+  out.flush();
+  out.close();
+  in.close();
+  return true;
+}
+
+static String baseNameOnly(const String& p){
+  int s = p.lastIndexOf('/');
+  return (s >= 0) ? p.substring(s+1) : p;
+}
+
+// RFC 3986 encode for query values; keep '/' so paths survive in the value.
+static String urlEncode(const String& s){
+  const char* hex="0123456789ABCDEF";
+  String out; out.reserve(s.length()*3);
+  for(size_t i=0;i<s.length();i++){
+    unsigned char c=(unsigned char)s[i];
+    if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~'||c=='/'){
+      out += (char)c;
+    }else{
+      out += '%'; out += hex[(c>>4)&0xF]; out += hex[c&0xF];
+    }
+  }
+  return out;
+}
+// Percent-decoder for query values. DOES NOT convert '+' to space.
+static String urlDecodeMin(const String& s){
+  String out; out.reserve(s.length());
+  for(size_t i=0;i<s.length();){
+    char c=s[i];
+    if(c=='%' && i+2<s.length()){
+      auto h=[&](char ch)->int{ if(ch>='0'&&ch<='9')return ch-'0'; if(ch>='A'&&ch<='F')return ch-'A'+10; if(ch>='a'&&ch<='f')return ch-'a'+10; return -1; };
+      int a=h(s[i+1]); int b=h(s[i+2]);
+      if(a>=0&&b>=0){ out += char((a<<4)|b); i+=3; continue; }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+static inline bool isBaseDirAllowed(const String& dir){
+  return dir.startsWith(STL_DIR) || dir.startsWith(CTB_DIR);
+}
+static String sanitizeDir(String dir) {
+  if (!dir.length()) return String(STL_DIR);
+  if (dir[0] != '/') dir = "/" + dir;
+  dir.replace("..", "");
+  if (!isBaseDirAllowed(dir)) dir = String(STL_DIR);
+  while (dir.indexOf("//") >= 0) dir.replace("//", "/");
+  if (dir.length()>1 && dir.endsWith("/")) dir.remove(dir.length()-1);
+  return dir;
+}
+static bool isThumbDirPath(const String& p){
+  return p == String(TH_ROOT_DIR) || p.startsWith(String(TH_ROOT_DIR) + "/");
+}
+
+// ===== CRC32 util for path hashing =====
+static uint32_t crc32_upd(uint32_t c, uint8_t b){ c^=b; for(int i=0;i<8;i++) c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1); return c; }
+static uint32_t crc32_bytes(const uint8_t* p, size_t n){ uint32_t c=0xFFFFFFFFu; for(size_t i=0;i<n;i++) c=crc32_upd(c,p[i]); return ~c; }
+
+// Canonical path used only for hashing (LEGACY: case-sensitive)
+static String canonicalForHashOld(String p){
+  if (!p.length() || p[0]!='/') p = "/" + p;
+  while (p.indexOf("//")>=0) p.replace("//","/");
+
+  if (isSupportedFile(p) && !isBaseDirAllowed(p)) {
+    p = joinPath(String(STL_DIR), (p[0]=='/')? p.substring(1):p);
+  }
+  return p;
+}
+
+// Canonical path used only for hashing (NEW: case-insensitive)
+static String canonicalForHashNew(String p){
+  String canon = canonicalForHashOld(p);
+  canon.toLowerCase(); // <-- key fix: path case no longer changes hash
+  return canon;
+}
+
+static uint32_t crc32_str_old(const String& s){
+  String canon = canonicalForHashOld(s);
+  return crc32_bytes((const uint8_t*)canon.c_str(), canon.length());
+}
+static uint32_t crc32_str_new(const String& s){
+  String canon = canonicalForHashNew(s);
+  return crc32_bytes((const uint8_t*)canon.c_str(), canon.length());
+}
+
+static String sanitizeForThumb(const String& s){
+  String out; out.reserve(s.length());
+  for(size_t i=0;i<s.length();++i){
+    char c = s[i];
+    if( (c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') || c=='_' || c=='-' ) out += c;
+    else out += '_';
+  }
+  return out;
+}
+static inline const char* thumbDirForFile(const String& filePath){
+  String lo = filePath; lo.toLowerCase();
+  if (lo.endsWith(".ctb")) return TH_CTB_DIR;
+  return TH_STL_DIR;
+}
+
+// NEW thumb filename (case-insensitive hash)
+static String pngForNew(const String& filePath){
+  String canon = canonicalForHashNew(filePath);
+  String base  = baseNameNoExt(canon);
+  String san   = sanitizeForThumb(base);
+  char hex[9]; uint32_t h = crc32_str_new(canon); sprintf(hex, "%08X", (unsigned)h);
+  const char* sub = thumbDirForFile(canon);
+  return String(sub) + "/" + san + "_" + hex + ".png";
+}
+
+// OLD thumb filename (legacy case-sensitive hash)
+static String pngForOld(const String& filePath){
+  String canon = canonicalForHashOld(filePath);
+  String base  = baseNameNoExt(canon);
+  String san   = sanitizeForThumb(base);
+  char hex[9]; uint32_t h = crc32_str_old(canon); sprintf(hex, "%08X", (unsigned)h);
+  const char* sub = thumbDirForFile(canon);
+  return String(sub) + "/" + san + "_" + hex + ".png";
+}
+
+// COMPAT: show existing legacy thumbs, otherwise use new path
+static String pngForExistingOrNew(const String& filePath){
+  String oldp = pngForOld(filePath);
+  if (SD.exists(oldp)) return oldp;
+  return pngForNew(filePath);
+}
+
+static void deleteThumbForFileBoth(const String& filePath){
+  String oldp = pngForOld(filePath);
+  String newp = pngForNew(filePath);
+  if (SD.exists(oldp)) SD.remove(oldp);
+  if (newp != oldp && SD.exists(newp)) SD.remove(newp);
+}
+
+// ===== Dir helpers =====
+static void ensureDir(const char* d){ if(!SD.exists(d)) SD.mkdir(d); }
+static void ensureThumbDirs(){
+  ensureDir(TH_ROOT_DIR);
+  ensureDir(TH_STL_DIR);
+  ensureDir(TH_CTB_DIR);
+}
+
+// ===== PNG writer helpers =====
+static inline bool writeU32(fs::File& f,uint32_t v){
+  uint8_t b[4]={(uint8_t)(v>>24),(uint8_t)(v>>16),(uint8_t)(v>>8),(uint8_t)v};
+  return f.write(b,4)==4;
+}
+static bool chunkBegin(fs::File& f, const char* type, uint32_t len, PNGCrc& crc){
+  if(!writeU32(f,len)) return false;
+  if(f.write((const uint8_t*)type,4)!=4) return false;
+  crc=PNGCrc(); crc.feed((const uint8_t*)type,4);
+  return true;
+}
+static bool chunkData(fs::File& f, PNGCrc& crc, const uint8_t* data, uint32_t n){
+  if(n && f.write(data,n)!=n) return false;
+  if(n) crc.feed(data,n);
+  return true;
+}
+static bool chunkEnd(fs::File& f, PNGCrc& crc){ return writeU32(f, crc.get()); }
+
+static bool writePNGRGBA_stream(fs::File& f,const uint8_t* img,uint32_t W,uint32_t H){
+  static const uint8_t sig[8]={137,80,78,71,13,10,26,10};
+  if(!f.write(sig,8)) return false;
+
+  uint8_t IHDR[13];
+  IHDR[0]=(W>>24)&255;IHDR[1]=(W>>16)&255;IHDR[2]=(W>>8)&255;IHDR[3]=W&255;
+  IHDR[4]=(H>>24)&255;IHDR[5]=(H>>16)&255;IHDR[6]=(H>>8)&255;IHDR[7]=H&255;
+  IHDR[8]=8;IHDR[9]=6;IHDR[10]=0;IHDR[11]=0;IHDR[12]=0;
+  PNGCrc cIH; if(!chunkBegin(f,"IHDR",13,cIH)) return false;
+  if(!chunkData(f,cIH,IHDR,13)) return false;
+  if(!chunkEnd(f,cIH)) return false;
+
+  const uint32_t row = 1 + 4*W;
+  const uint32_t raw = H * row;
+  const uint32_t max_rows = 65535u / row;
+  uint32_t rows_remaining = H;
+  const uint32_t blocks = (rows_remaining + max_rows - 1) / max_rows;
+  const uint32_t zlen = 2 + blocks*5 + raw + 4;
+
+  PNGCrc cID; if(!chunkBegin(f,"IDAT", zlen, cID)) return false;
+  uint8_t zhdr[2]={0x78,0x01}; if(!chunkData(f,cID,zhdr,2)) return false;
+
+  uint32_t s1=1,s2=0, rows_written=0;
+  while(rows_remaining){
+    uint32_t rb = rows_remaining; if(rb>max_rows) rb=max_rows;
+    uint32_t LEN = rb * row; uint16_t L16=(uint16_t)LEN, NL16=~L16;
+    uint8_t bh[5];
+    bh[0]=(rows_remaining==rb)?1:0;
+    bh[1]=L16&0xFF; bh[2]=(L16>>8)&0xFF; bh[3]=NL16&0xFF; bh[4]=(NL16>>8)&0xFF;
+    if(!chunkData(f,cID,bh,5)) return false;
+
+    for(uint32_t r=0;r<rb;r++){
+      uint8_t filter=0; if(!chunkData(f,cID,&filter,1)) return false;
+      s1=(s1+filter)%65521; s2=(s2+s1)%65521;
+
+      const uint8_t* line = img + (rows_written+r)*W*4;
+      if(!chunkData(f,cID, line, W*4)) return false;
+      for(uint32_t i=0;i<W*4;i++){ s1=(s1+line[i])%65521; s2=(s2+s1)%65521; }
+    }
+    rows_written += rb; rows_remaining -= rb;
+  }
+
+  uint32_t ad=(s2<<16)|s1;
+  uint8_t ad4[4]={(uint8_t)(ad>>24),(uint8_t)(ad>>16),(uint8_t)(ad>>8),(uint8_t)ad};
+  if(!chunkData(f,cID,ad4,4)) return false;
+  if(!chunkEnd(f,cID)) return false;
+
+  PNGCrc cIE; if(!chunkBegin(f,"IEND",0,cIE)) return false;
+  if(!chunkEnd(f,cIE)) return false;
+  return true;
+}
+
+// ===== CTB fallback placeholder drawing =====
+static void drawRect(ImgBuf& img, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b){
+  if (x0<0) x0=0; if(y0<0) y0=0; if (x1>=TH_W) x1=TH_W-1; if (y1>=TH_H) y1=TH_H-1;
+  for (int y=y0;y<=y1;y++){
+    for (int x=x0;x<=x1;x++){
+      img.setRGBA(x,y,r,g,b,255, -1.0f);
+    }
+  }
+}
+static const uint8_t CH_C[7] = {0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110};
+static const uint8_t CH_T[7] = {0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100};
+static const uint8_t CH_B[7] = {0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110};
+
+static void drawChar5x7(ImgBuf& img, int x, int y, const uint8_t rows[7], uint8_t r,uint8_t g,uint8_t b){
+  for (int yy=0; yy<7; yy++){
+    uint8_t bits = rows[yy];
+    for (int xx=0; xx<5; xx++){
+      if (bits & (1<<(4-xx))){
+        img.setRGBA(x+xx,y+yy,r,g,b,255,-2.0f);
+      }
+    }
+  }
+}
+static void drawTextCTB(ImgBuf& img){
+  img.clear(235,238,245,255);
+  drawRect(img, 10, 16, TH_W-11, TH_H-17, 18, 22, 29);
+  drawRect(img, 10, 16, TH_W-11, 30, 106, 160, 255);
+
+  int cx = (TH_W - (3*5 + 2*4)) / 2;
+  int cy = (TH_H - 7) / 2;
+  drawChar5x7(img, cx, cy, CH_C, 235,238,245);
+  drawChar5x7(img, cx+5+4, cy, CH_T, 235,238,245);
+  drawChar5x7(img, cx+2*(5+4), cy, CH_B, 235,238,245);
+
+  drawRect(img, 18, TH_H-28, TH_W-19, TH_H-28, 55, 65, 80);
+}
+
+// ===== STL raster pipeline =====
+static inline void isoRotate(const Vec3& in, Vec3& out){
+  const float ay=45.0f*(float)M_PI/180.0f;
+  const float ax=35.264f*(float)M_PI/180.0f;
+  const float cy=cosf(ay), sy=sinf(ay);
+  const float cx=cosf(ax), sx=sinf(ax);
+  float xr=in.x*cy+in.z*sy;
+  float zr=-in.x*sy+in.z*cy;
+  float yr=in.y;
+  out.x=xr; out.y=yr*cx-zr*sx; out.z=yr*sx+zr*cx;
+}
+static inline void drawTriRGBA(ImgBuf& img,
+  float x0,float y0,float z0,float x1,float y1,float z1,float x2,float y2,float z2,
+  uint8_t r,uint8_t g,uint8_t b,uint8_t a)
+{
+  float minx=floorf(fmin3(x0,x1,x2)), maxx=ceilf(fmax3(x0,x1,x2));
+  float miny=floorf(fmin3(y0,y1,y2)), maxy=ceilf(fmax3(y0,y1,y2));
+  if(maxx<0||maxy<0||minx>=TH_W||miny>=TH_H) return;
+  int ix0=max(0,(int)minx), ix1=min(TH_W-1,(int)maxx);
+  int iy0=max(0,(int)miny), iy1=min(TH_H-1,(int)maxy);
+  float area=edgeFunc(x0,y0,x1,y1,x2,y2); if(area==0) return;
+  float invA=1.0f/area;
+  for(int y=iy0;y<=iy1;y++){
+    for(int x=ix0;x<=ix1;x++){
+      float w0=edgeFunc(x1,y1,x2,y2,x+0.5f,y+0.5f)*invA;
+      float w1=edgeFunc(x2,y2,x0,y0,x+0.5f,y+0.5f)*invA;
+      float w2=1.0f-w0-w1;
+      if(w0>=0&&w1>=0&&w2>=0){
+        float z=w0*z0+w1*z1+w2*z2;
+        img.setRGBA(x,y,r,g,b,a,z);
+      }
+    }
+  }
+}
+static void drawShadowEllipse(ImgBuf& img, float cx, float cy, float rx, float ry, uint8_t a){
+  float z=1e29f;
+  int xmin=max(0,(int)floorf(cx-rx)), xmax=min(TH_W-1,(int)ceilf(cx+rx));
+  int ymin=max(0,(int)floorf(cy-ry)), ymax=min(TH_H-1,(int)ceilf(cy+ry));
+  for(int y=ymin;y<=ymax;y++){
+    for(int x=xmin;x<=xmax;x++){
+      float nx=(x-cx)/rx, ny=(y-cy)/ry, d=nx*nx+ny*ny;
+      if(d<=1.0f){
+        float t=1.0f-d; if(t<0)t=0; if(t>1)t=1;
+        uint8_t al=(uint8_t)(a*t);
+        img.setRGBA(x,y,0,0,0,al,z);
+      }
+    }
+  }
+}
+
+// ===== Robust STL detection + ASCII->Binary conversion =====
+static bool isLikelyAsciiSTL(fs::File &f){
+  if(!f) return false;
+  size_t n = min<uint32_t>(512, f.size());
+  std::vector<uint8_t> buf(n);
+  f.seek(0);
+  f.read(buf.data(), n);
+  bool startsSolid = (n>=5 && memcmp(buf.data(),"solid",5)==0);
+  int nonPrint=0;
+  for(size_t i=0;i<n;i++){
+    uint8_t c=buf[i];
+    if(c==9||c==10||c==13) continue;
+    if(c<32 || c>126) nonPrint++;
+  }
+  if(nonPrint>0 && !startsSolid) return false;
+  if(startsSolid && nonPrint<10) return true;
+  const char* p=(const char*)buf.data();
+  return strstr(p,"facet")!=nullptr;
+}
+
+static bool convertAsciiToBinary_stream(const String& path){
+  fs::File in=SD.open(path, FILE_READ);
+  if(!in) return false;
+
+  if(in.size()>=84){
+    in.seek(80); uint32_t tri; if(in.read((uint8_t*)&tri,4)==4){
+      uint64_t exp=84ULL+(uint64_t)tri*50ULL;
+      if((uint64_t)in.size()==exp){ in.close(); return true; }
+    }
+  }
+  in.seek(0);
+  if(!isLikelyAsciiSTL(in)){ in.close(); return true; }
+
+  String tmp=path+".tmp";
+  SD.remove(tmp);
+  fs::File out=SD.open(tmp, FILE_WRITE);
+  if(!out){ in.close(); return false; }
+
+  uint8_t hdr[80]; memset(hdr,0,sizeof(hdr));
+  out.write(hdr,80);
+  uint32_t triCount=0;
+  out.write((uint8_t*)&triCount,4);
+
+  in.seek(0);
+  char lineBuf[256];
+  Vec3 n={0,0,1}, v[3]; int vi=0;
+
+  auto startsWith = [](const String& s, const char* p)->bool{
+    int L=strlen(p); if((int)s.length()<L) return false;
+    for(int i=0;i<L;i++) if(tolower((unsigned char)s[i])!=tolower((unsigned char)p[i])) return false;
+    return true;
+  };
+
+  while(in.available()){
+    size_t k = in.readBytesUntil('\n', lineBuf, sizeof(lineBuf)-1);
+    lineBuf[k]=0;
+    String line(lineBuf); line.trim();
+    if(!line.length()) { heartbeat(); continue; }
+
+    if(startsWith(line,"facet normal")){
+      float nx=0,ny=0,nz=1;
+      sscanf(line.c_str(),"facet normal %f %f %f",&nx,&ny,&nz);
+      n={nx,ny,nz}; vi=0;
+    }else if(startsWith(line,"vertex")){
+      float x=0,y=0,z=0;
+      sscanf(line.c_str(),"vertex %f %f %f",&x,&y,&z);
+      v[vi++]={x,y,z};
+      if(vi==3){
+        out.write((uint8_t*)&n,12);
+        out.write((uint8_t*)&v[0],12);
+        out.write((uint8_t*)&v[1],12);
+        out.write((uint8_t*)&v[2],12);
+        uint16_t a=0; out.write((uint8_t*)&a,2);
+        triCount++; vi=0;
+      }
+    }
+    if((triCount & 0x7FF)==0) { heartbeat(); }
+  }
+
+  in.close();
+  out.flush();
+  out.seek(80);
+  out.write((uint8_t*)&triCount,4);
+  out.close();
+
+  if(triCount==0){ SD.remove(tmp); return false; }
+  SD.remove(path);
+  if(!SD.rename(tmp.c_str(), path.c_str())){ SD.remove(tmp); return false; }
+  return true;
+}
+
+// ===== Binary STL bounds & render =====
+static bool boundsBinary(fs::File& f, Vec3& c, float& diag){
+  if(!f) return false;
+  if(f.size()<84) return false;
+  f.seek(80); uint32_t tri; if(f.read((uint8_t*)&tri,4)!=4) return false;
+  uint64_t expected=84ULL + (uint64_t)tri*50ULL;
+  if(expected != (uint64_t)f.size()) return false;
+  f.seek(84);
+  Vec3 v0,v1,v2,n; float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f,zmin=1e30f,zmax=-1e30f;
+  for(uint32_t i=0;i<tri;i++){
+    if(f.read((uint8_t*)&n,12)!=12) return false;
+    if(f.read((uint8_t*)&v0,12)!=12) return false;
+    if(f.read((uint8_t*)&v1,12)!=12) return false;
+    if(f.read((uint8_t*)&v2,12)!=12) return false;
+    f.seek(f.position()+2);
+    xmin=min(xmin,fmin3(v0.x,v1.x,v2.x)); xmax=max(xmax,fmax3(v0.x,v1.x,v2.x));
+    ymin=min(ymin,fmin3(v0.y,v1.y,v2.y)); ymax=max(ymax,fmax3(v0.y,v1.y,v2.y));
+    zmin=min(zmin,fmin3(v0.z,v1.z,v2.z)); zmax=max(zmax,fmax3(v0.z,v1.z,v2.z));
+    if((i & 0x3FF)==0){ heartbeat(); }
+  }
+  c.x=(xmin+xmax)*0.5f; c.y=(ymin+ymax)*0.5f; c.z=(zmin+zmax)*0.5f;
+  diag=max(max(xmax-xmin,ymax-ymin),zmax-zmin); if(diag<=0) diag=1.0f;
+  return true;
+}
+
+static bool renderBinary(fs::File& f, ImgBuf& img, const Vec3& c, float diag){
+  if(!f) return false;
+  f.seek(80); uint32_t tri; if(f.read((uint8_t*)&tri,4)!=4) return false;
+  f.seek(84);
+  Vec3 v0,v1,v2,n;
+  const float half = min(TH_W,TH_H) * 0.78f;
+  const Vec3 L={0.577f,0.577f,0.577f};
+
+  auto proj=[&](const Vec3& v,float& x2,float& y2,float& z2){
+    Vec3 t{ (v.x-c.x)/diag, (v.y-c.y)/diag, (v.z-c.z)/diag }, r;
+    isoRotate(t,r);
+    x2=r.x*half + TH_W*0.5f; y2=-r.y*half + TH_H*0.5f; z2=r.z;
+  };
+
+  float pminx=1e9f,pmaxx=-1e9f,pminy=1e9f,pmaxy=-1e9f;
+  const int startP = 60;
+  const int endP   = 85;
+  setProg(startP);
+
+  for(uint32_t i=0;i<tri;i++){
+    if(f.read((uint8_t*)&n,12)!=12) return false;
+    if(f.read((uint8_t*)&v0,12)!=12) return false;
+    if(f.read((uint8_t*)&v1,12)!=12) return false;
+    if(f.read((uint8_t*)&v2,12)!=12) return false;
+    f.seek(f.position()+2);
+
+    Vec3 rn; isoRotate(n, rn);
+    float nl=sqrtf(rn.x*rn.x+rn.y*rn.y+rn.z*rn.z); if(nl>0){ rn.x/=nl; rn.y/=nl; rn.z/=nl; }
+    float diffuse = max(0.0f, rn.x*L.x + rn.y*L.y + rn.z*L.z);
+    float shade = 0.10f + 0.90f*diffuse; if(shade>1.0f) shade=1.0f;
+
+    uint8_t rr=(uint8_t)max(0, min(255,(int)(255.0f*0.80f*shade)));
+    uint8_t gg=(uint8_t)max(0, min(255,(int)(255.0f*0.83f*shade)));
+    uint8_t bb=(uint8_t)max(0, min(255,(int)(255.0f*0.90f*shade)));
+
+    float x0,y0,z0,x1,y1,z1,x2,y2,z2; proj(v0,x0,y0,z0); proj(v1,x1,y1,z1); proj(v2,x2,y2,z2);
+    pminx=min(pminx, fmin3(x0,x1,x2)); pmaxx=max(pmaxx, fmax3(x0,x1,x2));
+    pminy=min(pminy, fmin3(y0,y1,y2)); pmaxy=max(pmaxy, fmax3(y0,y1,y2));
+
+    float area=(x1-x0)*(y2-y0)-(y1-y0)*(x2-x0);
+    if(area==0) continue;
+    drawTriRGBA(img,x0,y0,z0,x1,y1,z1,x2,y2,z2, rr,gg,bb,255);
+
+    if((i & 0x3FF)==0){
+      int p = startP + (int)((uint64_t)i * (endP - startP) / (tri ? tri : 1));
+      setProg(p);
+      heartbeat();
+    }
+  }
+
+  if(pmaxx>pminx && pmaxy>pminy){
+    float cx=(pminx+pmaxx)*0.5f, cy=pmaxy+4.0f, rx=(pmaxx-pminx)*0.40f, ry=(pmaxx-pminx)*0.22f;
+    drawShadowEllipse(img, cx, cy, rx, ry, 90);
+  }
+  setProg(endP);
+  return true;
+}
+
+// ===== Thumbnail generation =====
+static bool writeThumbToPath(const String& pngPath){
+  ensureThumbDirs();
+  SD.remove(pngPath);
+  fs::File png=SD.open(pngPath, FILE_WRITE);
+  if(!png) return false;
+  bool wrote=writePNGRGBA_stream(png,g_img.rgba,TH_W,TH_H);
+  png.close();
+  return wrote;
+}
+
+static bool generateThumbSTL(const char* stlPath, const String& pngPath){
+  setStatus("Converting", stlPath, 5);
+  if(!convertAsciiToBinary_stream(String(stlPath))){
+    g_busy=false; return false;
+  }
+  heartbeat();
+
+  setStatus("Bounding", stlPath, 20);
+  fs::File f=SD.open(stlPath, FILE_READ);
+  if(!f){ g_busy=false; return false; }
+  Vec3 c; float diag; g_img.clear();
+  if(!boundsBinary(f,c,diag)){ f.close(); g_busy=false; return false; }
+  heartbeat();
+
+  setStatus("Rendering", stlPath, 60);
+  f.seek(0); bool ok=renderBinary(f,g_img,c,diag); f.close();
+  if(!ok){ g_busy=false; return false; }
+  heartbeat();
+
+  setStatus("Writing PNG", stlPath, 90);
+  bool wrote = writeThumbToPath(pngPath);
+
+  setStatus("Done", stlPath, 100);
+  delay(5);
+  g_busy=false;
+  return wrote;
+}
+
+// --- CTB auto preview decode + fallback placeholder ---
+static bool generateThumbCTB_RealPreview_Auto(const char* ctbPath, const String& pngPath){
+  setStatus("CTB: scanning preview", ctbPath, 15);
+
+  fs::File f = SD.open(ctbPath, FILE_READ);
+  if (!f){
+    Serial.printf("[CTB] open failed: %s\n", ctbPath);
+    g_busy=false;
+    return false;
+  }
+
+  std::vector<CTBPreviewCand> cands;
+
+// Prefer deterministic CTB v5 (Chitubox v1.0.1) small preview (400x300) when available.
+// Falls back to heuristic scanning if not found.
+{
+  uint32_t vw=0, vh=0, vo=0, vl=0;
+  if (ctbTryGetV5SmallPreview(f, vw, vh, vo, vl)){
+    CTBPreviewCand pv{};
+    pv.w = vw;
+    pv.h = vh;
+    pv.imageOffset = vo;
+    pv.imageLength = vl;
+    pv.kind = CTBPreviewKind::RGB15_RLE;
+    cands.push_back(pv);
+    Serial.printf("[CTB] v5 small preview found: %lux%lu off=%lu len=%lu\n",
+                  (unsigned long)vw, (unsigned long)vh, (unsigned long)vo, (unsigned long)vl);
+  }
+}
+
+// If deterministic parse didn't find it, scan for preview candidates.
+if (cands.empty()){
+  ctbCollectPreviewCandidates(f, cands);
+} else {
+  // Still scan as a secondary option (rare edge cases), but keep v5 small preview as the first choice.
+  std::vector<CTBPreviewCand> extra;
+  ctbCollectPreviewCandidates(f, extra);
+  for (auto &e : extra) cands.push_back(e);
+}
+
+  if (cands.empty()){
+    Serial.printf("[CTB] no preview candidates found (scan window). file=%s size=%llu\n",
+                  ctbPath, (unsigned long long)f.size());
+    f.close();
+    return false;
+  }
+
+  std::sort(cands.begin(), cands.end(), [](const CTBPreviewCand& a, const CTBPreviewCand& b){
+    bool a400 = (a.w==400 && a.h==300);
+    bool b400 = (b.w==400 && b.h==300);
+    if (a400 != b400) return a400 > b400;
+    uint64_t aa = (uint64_t)a.w * a.h;
+    uint64_t bb = (uint64_t)b.w * b.h;
+    if (aa != bb) return aa > bb;
+    return a.imageLength < b.imageLength;
+  });
+
+  Serial.printf("[CTB] %u preview candidates found. Trying best-first...\n", (unsigned)cands.size());
+
+  const int MAX_TRIES = 10;
+  int tries = 0;
+
+  for (auto& pv : cands){
+    if (tries++ >= MAX_TRIES) break;
+
+    uint64_t pixels64 = (uint64_t)pv.w * (uint64_t)pv.h;
+    if (pixels64 > 3000000ULL) continue;
+    uint32_t pixels = (uint32_t)pixels64;
+
+    Serial.printf("[CTB] try #%d: %ux%u off=%u len=%u struct@%u\n",
+                  tries, (unsigned)pv.w, (unsigned)pv.h,
+                  (unsigned)pv.imageOffset, (unsigned)pv.imageLength, (unsigned)pv.structOffset);
+
+    uint16_t* fb = nullptr;
+#if ARDUINO_ARCH_ESP32
+    fb = (uint16_t*)heap_caps_malloc((size_t)pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!fb) fb = (uint16_t*)heap_caps_malloc((size_t)pixels * sizeof(uint16_t), MALLOC_CAP_8BIT);
+#else
+    fb = (uint16_t*)malloc((size_t)pixels * sizeof(uint16_t));
+#endif
+    if (!fb){
+      Serial.printf("[CTB] alloc failed for %u pixels (%u KB)\n", (unsigned)pixels, (unsigned)((pixels*2)/1024));
+      continue;
+    }
+
+    setStatus("CTB: decoding RLE", ctbPath, 55);
+    uint32_t wrotePix = ctbDecodeRGB15RLE_toRGB565(f, pv.imageOffset, pv.imageLength, fb, pixels);
+
+    if (wrotePix < (pixels / 3)){
+      Serial.printf("[CTB] decode too small: wrotePix=%u / %u\n", (unsigned)wrotePix, (unsigned)pixels);
+#if ARDUINO_ARCH_ESP32
+      heap_caps_free(fb);
+#else
+      free(fb);
+#endif
+      continue;
+    }
+
+    setStatus("CTB: downscaling", ctbPath, 75);
+    ctbDownscale_toThumbRGBA(fb, pv.w, pv.h, g_img);
+
+#if ARDUINO_ARCH_ESP32
+    heap_caps_free(fb);
+#else
+    free(fb);
+#endif
+
+    heartbeat();
+    setStatus("Writing PNG", ctbPath, 90);
+    bool wrote = writeThumbToPath(pngPath);
+
+    if (!wrote){
+      Serial.printf("[CTB] PNG write failed: %s\n", pngPath.c_str());
+      continue;
+    }
+
+    Serial.printf("[CTB] success using %ux%u preview.\n", (unsigned)pv.w, (unsigned)pv.h);
+    setStatus("Done", ctbPath, 100);
+    delay(5);
+    g_busy=false;
+    f.close();
+    return true;
+  }
+
+  Serial.printf("[CTB] all candidates failed; falling back to placeholder.\n");
+  f.close();
+  return false;
+}
+
+static bool generateThumbCTB(const char* ctbPath, const String& pngPath){
+  bool ok = generateThumbCTB_RealPreview_Auto(ctbPath, pngPath);
+  if (ok) return true;
+
+  setStatus("Rendering", ctbPath, 70);
+  drawTextCTB(g_img);
+  heartbeat();
+  setStatus("Writing PNG", ctbPath, 90);
+  bool wrote = writeThumbToPath(pngPath);
+  setStatus("Done", ctbPath, 100);
+  delay(5);
+  g_busy=false;
+  return wrote;
+}
+
+// ============================================================
+// generateThumbAny()
+// - always writes to NEW thumb path (case-insensitive hash)
+// - also deletes any legacy thumb so you don't accumulate dupes
+// ============================================================
+static bool generateThumbAny(const String& filePath){
+  if (!filePath.length()) return false;
+
+  String p = filePath;
+  if (p[0] != '/') p = "/" + p;
+  while (p.indexOf("//") >= 0) p.replace("//", "/");
+
+  if (!isSupportedFile(p)) return false;
+
+  if (!isBaseDirAllowed(p)){
+    if (hasCTBExt(p)) p = joinPath(String(CTB_DIR), p.substring(1));
+    else              p = joinPath(String(STL_DIR), p.substring(1));
+  }
+
+  // Always generate into NEW scheme, but remove legacy if present
+  deleteThumbForFileBoth(p);
+  const String pngPath = pngForNew(p);
+
+  if (hasSTLExt(p)) return generateThumbSTL(p.c_str(), pngPath);
+  if (hasCTBExt(p)) return generateThumbCTB(p.c_str(), pngPath);
+  return false;
+}
+
+// ===== Queue =====
+static bool qIsEmpty(){ return qhead==qtail; }
+static bool qIsFull(){ return ((qhead+1)%QMAX)==qtail; }
+
+static void qEnqueue(const String& p){
+  if(qIsFull()) return;
+  String s = p;
+  if(!s.length()) return;
+  if (s[0] != '/') s = "/" + s;
+  while (s.indexOf("//")>=0) s.replace("//","/");
+
+  if(!isBaseDirAllowed(s)){
+    if (hasCTBExt(s)) s = joinPath(String(CTB_DIR), s[0]=='/'? s.substring(1):s);
+    else              s = joinPath(String(STL_DIR), s[0]=='/'? s.substring(1):s);
+  }
+  qitems[qhead]=s; qhead=(qhead+1)%QMAX;
+}
+
+static String qDequeue(){
+  if(qIsEmpty()) return String();
+  String s=qitems[qtail]; qitems[qtail]=String(); qtail=(qtail+1)%QMAX;
+  return s;
+}
+
+static void scanDirAndQueueMissing(const String& dir){
+  fs::File r=SD.open(dir);
+  if(!r||!r.isDirectory()) return;
+  fs::File f=r.openNextFile();
+  while(f){
+    String n=f.name();
+    if(n.length() && n[0] != '/') n = "/" + n;
+    while (n.indexOf("//") >= 0) n.replace("//","/");
+
+    if(f.isDirectory()){
+      if(isThumbDirPath(n)) { f=r.openNextFile(); continue; }
+      scanDirAndQueueMissing(n);
+    } else if(isSupportedFile(n)){
+      // Missing if neither legacy nor new exists
+      String oldp = pngForOld(n);
+      String newp = pngForNew(n);
+      if(!SD.exists(oldp) && !SD.exists(newp)) qEnqueue(n);
+    }
+    f=r.openNextFile(); heartbeat();
+  }
+}
+
+static void wipeThumbsIn(const char* subdir){
+  fs::File d=SD.open(subdir);
+  if(!d) return;
+  fs::File f=d.openNextFile();
+  while(f){
+    String p=f.name();
+    if(!f.isDirectory() && p.endsWith(".png")) SD.remove(p);
+    f=d.openNextFile(); heartbeat();
+  }
+}
+static void wipeThumbs(){
+  ensureThumbDirs();
+  wipeThumbsIn(TH_STL_DIR);
+  wipeThumbsIn(TH_CTB_DIR);
+}
+
+// ===== File path helper =====
+static String ensureAllowedFilePathFromArg(const String& argName){
+  String n=server.hasArg(argName)? urlDecodeMin(server.arg(argName)) : String();
+  if(!n.length()) return String();
+  String p=ensureSlash(n);
+  p.replace("..", "");
+  while (p.indexOf("//")>=0) p.replace("//","/");
+
+  if(!isBaseDirAllowed(p)){
+    if (hasCTBExt(p)) p = joinPath(String(CTB_DIR), p[0]=='/'? p.substring(1):p);
+    else              p = joinPath(String(STL_DIR), p[0]=='/'? p.substring(1):p);
+  }
+  return p;
+}
+
+// ===== Self-hosted 3D Preview JS (no CDN) =====
+static void handleStlViewJs(){
+  const char* js = R"JS(
+(function(){
+  "use strict";
+  function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+
+  function parseSTL(arrayBuffer){
+    const u8 = new Uint8Array(arrayBuffer);
+    const dv = new DataView(arrayBuffer);
+
+    let isBinary = false;
+    if (u8.byteLength >= 84){
+      const tri = dv.getUint32(80, true);
+      const expected = 84 + tri * 50;
+      if (expected === u8.byteLength) isBinary = true;
+    }
+
+    let tris = [];
+    if (isBinary){
+      const tri = dv.getUint32(80, true);
+      let off = 84;
+      for (let i=0;i<tri;i++){
+        off += 12;
+        for (let k=0;k<9;k++){
+          tris.push(dv.getFloat32(off, true));
+          off += 4;
+        }
+        off += 2;
+      }
+    } else {
+      const txt = new TextDecoder("utf-8", {fatal:false}).decode(u8);
+      const re = /vertex\s+([+\-]?\d*\.?\d+(?:[eE][+\-]?\d+)?)\s+([+\-]?\d*\.?\d+(?:[eE][+\-]?\d+)?)\s+([+\-]?\d*\.?\d+(?:[eE][+\-]?\d+)?)/g;
+      let m;
+      while((m = re.exec(txt)) !== null){
+        tris.push(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]));
+      }
+    }
+
+    const f = new Float32Array(tris);
+    let minx=1e30,miny=1e30,minz=1e30, maxx=-1e30,maxy=-1e30,maxz=-1e30;
+    for (let i=0;i<f.length;i+=3){
+      const x=f[i], y=f[i+1], z=f[i+2];
+      if (x<minx) minx=x; if (y<miny) miny=y; if (z<minz) minz=z;
+      if (x>maxx) maxx=x; if (y>maxy) maxy=y; if (z>maxz) maxz=z;
+    }
+    const cx=(minx+maxx)*0.5, cy=(miny+maxy)*0.5, cz=(minz+maxz)*0.5;
+    const dx=(maxx-minx), dy=(maxy-miny), dz=(maxz-minz);
+    const diag = Math.max(dx,dy,dz) || 1.0;
+
+    return { tris: f, bounds: { center:{x:cx,y:cy,z:cz}, diag:diag } };
+  }
+
+  function makeViewer(canvas, url){
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    function resize(){
+      const r = canvas.getBoundingClientRect();
+      const w = Math.max(2, Math.floor(r.width));
+      const h = Math.max(2, Math.floor(r.height));
+      if (canvas.width !== w || canvas.height !== h){
+        canvas.width = w;
+        canvas.height = h;
+      }
+    }
+
+    let zbuf = null;
+    function ensureZbuf(){
+      const n = canvas.width * canvas.height;
+      if (!zbuf || zbuf.length !== n) zbuf = new Float32Array(n);
+      zbuf.fill(1e30);
+    }
+
+    let yaw = 0.9, pitch = 0.6;
+    let dist = 2.8;
+    let drag=false, lx=0, ly=0;
+    function resetView(){ yaw = 0.9; pitch = 0.6; dist = 2.8; }
+
+    canvas.addEventListener("mousedown", (e)=>{ drag=true; lx=e.clientX; ly=e.clientY; });
+    window.addEventListener("mouseup", ()=>{ drag=false; });
+    window.addEventListener("mousemove", (e)=>{
+      if(!drag) return;
+      const dx=e.clientX-lx, dy=e.clientY-ly;
+      lx=e.clientX; ly=e.clientY;
+      yaw -= dx * 0.007;
+    pitch -= dy * 0.007;
+      pitch = clamp(pitch, -1.45, 1.45);
+    });
+    canvas.addEventListener("wheel", (e)=>{
+      e.preventDefault();
+      const s = Math.exp(e.deltaY * 0.0012);
+      dist *= s;
+      dist = clamp(dist, 0.6, 10.0);
+    }, {passive:false});
+    canvas.addEventListener("dblclick", ()=> resetView());
+
+    function rotY(vx,vy,vz,a){ const c=Math.cos(a), s=Math.sin(a); return [vx*c+vz*s, vy, -vx*s+vz*c]; }
+    function rotX(vx,vy,vz,a){ const c=Math.cos(a), s=Math.sin(a); return [vx, vy*c-vz*s, vy*s+vz*c]; }
+    function edge(ax,ay,bx,by,px,py){ return (px-ax)*(by-ay)-(py-ay)*(bx-ax); }
+
+    function draw(mesh){
+      resize(); ensureZbuf();
+      ctx.fillStyle = "#0e131b";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      const W=canvas.width, H=canvas.height;
+      const cx=W*0.5, cy=H*0.5;
+      const scale = 0.85 * Math.min(W,H) / mesh.bounds.diag;
+
+      const Lx=0.577, Ly=0.577, Lz=0.577;
+
+      const f = mesh.tris;
+      for (let i=0;i<f.length;i+=9){
+        let x0=f[i],   y0=f[i+1], z0=f[i+2];
+        let x1=f[i+3], y1=f[i+4], z1=f[i+5];
+        let x2=f[i+6], y2=f[i+7], z2=f[i+8];
+
+        x0-=mesh.bounds.center.x; y0-=mesh.bounds.center.y; z0-=mesh.bounds.center.z;
+        x1-=mesh.bounds.center.x; y1-=mesh.bounds.center.y; z1-=mesh.bounds.center.z;
+        x2-=mesh.bounds.center.x; y2-=mesh.bounds.center.y; z2-=mesh.bounds.center.z;
+
+        [x0,y0,z0]=rotY(x0,y0,z0,yaw); [x0,y0,z0]=rotX(x0,y0,z0,pitch);
+        [x1,y1,z1]=rotY(x1,y1,z1,yaw); [x1,y1,z1]=rotX(x1,y1,z1,pitch);
+        [x2,y2,z2]=rotY(x2,y2,z2,yaw); [x2,y2,z2]=rotX(x2,y2,z2,pitch);
+
+        const ux=x1-x0, uy=y1-y0, uz=z1-z0;
+        const vx=x2-x0, vy=y2-y0, vz=z2-z0;
+        let nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+        const nlen=Math.hypot(nx,ny,nz) || 1.0;
+        nx/=nlen; ny/=nlen; nz/=nlen;
+
+        const diff = Math.max(0, nx*Lx + ny*Ly + nz*Lz);
+        // Boost surface detail: stronger directional light + subtle rim lighting
+        const rim = 1.0 - Math.abs(nz);
+        const base = clamp(0.06 + 0.94*diff + 0.22*Math.pow(rim, 1.6), 0, 1);
+        // Slight gamma to pop midtones
+        const vcol = Math.floor(255 * Math.pow(base, 0.85));
+
+        const dzcam = dist * mesh.bounds.diag;
+        const zz0 = z0 + dzcam;
+        const zz1 = z1 + dzcam;
+        const zz2 = z2 + dzcam;
+
+        const sx0 = x0*scale + cx, sy0 = -y0*scale + cy;
+        const sx1 = x1*scale + cx, sy1 = -y1*scale + cy;
+        const sx2 = x2*scale + cx, sy2 = -y2*scale + cy;
+
+        let minx=Math.floor(Math.min(sx0,sx1,sx2)), maxx=Math.ceil(Math.max(sx0,sx1,sx2));
+        let miny=Math.floor(Math.min(sy0,sy1,sy2)), maxy=Math.ceil(Math.max(sy0,sy1,sy2));
+        if (maxx<0||maxy<0||minx>=W||miny>=H) continue;
+        minx=Math.max(0,minx); miny=Math.max(0,miny);
+        maxx=Math.min(W-1,maxx); maxy=Math.min(H-1,maxy);
+
+        const area = edge(sx0,sy0,sx1,sy1,sx2,sy2);
+        if (area === 0) continue;
+        const invA = 1.0/area;
+
+        const img = ctx.getImageData(minx,miny,(maxx-minx+1),(maxy-miny+1));
+        const data = img.data;
+        const rw = (maxx-minx+1);
+
+        for (let y=miny; y<=maxy; y++){
+          for (let x=minx; x<=maxx; x++){
+            const px=x+0.5, py=y+0.5;
+            const w0 = edge(sx1,sy1,sx2,sy2,px,py)*invA;
+            const w1 = edge(sx2,sy2,sx0,sy0,px,py)*invA;
+            const w2 = 1.0 - w0 - w1;
+
+            if ((w0>=0 && w1>=0 && w2>=0) || (w0<=0 && w1<=0 && w2<=0)){
+              const z = w0*zz0 + w1*zz1 + w2*zz2;
+              const idx = y*W + x;
+              if (z < zbuf[idx]){
+                zbuf[idx] = z;
+                const di = ((y-miny)*rw + (x-minx))*4;
+                data[di+0] = Math.floor(vcol*0.72);
+                data[di+1] = Math.floor(vcol*0.78);
+                data[di+2] = Math.floor(vcol*0.90);
+                data[di+3] = 255;
+              }
+            }
+          }
+        }
+        ctx.putImageData(img, minx, miny);
+      }
+    }
+
+    let mesh=null;
+    fetch(url, { cache: "no-store" })
+      .then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.arrayBuffer(); })
+      .then(buf=>{
+        mesh = parseSTL(buf);
+        resetView();
+        function tick(){ if(mesh) draw(mesh); requestAnimationFrame(tick); }
+        requestAnimationFrame(tick);
+      })
+      .catch(err=>{
+        resize();
+        ctx.fillStyle="#0e131b"; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle="#ff6a6a"; ctx.font="16px system-ui,Segoe UI,Arial";
+        ctx.fillText("Preview load failed: "+String(err), 14, 28);
+      });
+  }
+
+  window.initSTLViewer = function(canvasId, stlUrl){
+    const cv = document.getElementById(canvasId);
+    if(!cv) throw new Error("Canvas not found: "+canvasId);
+    makeViewer(cv, stlUrl);
+  };
+})();
+)JS";
+  server.send(200, "application/javascript; charset=utf-8", js);
+}
+
+// ===== HTML templates =====
+static String htmlHeader(const String& title, bool dark){
+  String s;
+  s += F("<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+         "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+         "<title>");
+  s += htmlEscape(title);
+  s += F("</title><style>");
+  if(dark) s += F(":root{--bg:#0b0e13;--card:#12161d;--muted:#1b212b;--text:#d7e0ea;--sub:#9db1c7;--accent:#6aa0ff;--danger:#ff6a6a;--good:#76ffb0;}");
+  else     s += F(":root{--bg:#e9eef5;--card:#ffffff;--muted:#dfe7f1;--text:#1b2330;--sub:#51647a;--accent:#2f6dff;--danger:#d64242;--good:#0b7a3b;}");
+  s += F("body{font-family:system-ui,Segoe UI,Roboto,Inter,Arial;margin:16px;background:var(--bg);color:var(--text)}"
+         "a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}"
+         ".top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}"
+         ".chip{background:var(--muted);padding:6px 10px;border-radius:999px;color:var(--sub);font-size:12px}"
+         ".panel{background:var(--card);border:1px solid #1e263233;border-radius:12px;padding:12px}"
+         "table{border-collapse:collapse;width:100%;margin-top:8px}"
+         "th,td{border-bottom:1px solid #1b233033;padding:8px;text-align:left;vertical-align:middle}"
+         "th a{color:var(--text)} th a:hover{color:var(--accent)}"
+         ".thumb{width:160px;height:120px;object-fit:contain;background:#ffffff;border:1px solid #1e263255;border-radius:8px}"
+         ".btn{padding:6px 10px;border:1px solid #2b364777;border-radius:8px;display:inline-block;margin-right:6px}"
+         ".btn.red{border-color:#5a1e1e;color:var(--danger)} .btn.blue{border-color:#233753;color:var(--accent)}"
+         ".btn.good{border-color:#1b5a38;color:var(--good)}"
+         "#progress{width:100%;height:10px;background:var(--muted);border:1px solid #1e263244;border-radius:999px;overflow:hidden;display:none;margin-top:8px}"
+         "#bar{width:0;height:100%;background:var(--accent)}"
+         ".row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}"
+         "input[type=checkbox]{transform:scale(1.2);}"
+         "</style></head><body>");
+  return s;
+}
+static String htmlFooter(){ return F("</body></html>"); }
+
+// ===== Directory listing =====
+static void listDirItems(const String& dir, std::vector<Item>& out, uint32_t& counter, uint64_t& totalSize, uint32_t& fileCount){
+  fs::File d=SD.open(dir); if(!d||!d.isDirectory()) return;
+  fs::File f=d.openNextFile();
+  while(f){
+    String p=f.name();
+    if (p.length() && p[0] != '/') p = "/" + p;
+    while (p.indexOf("//") >= 0) p.replace("//","/");
+    bool isD=f.isDirectory();
+
+    int slash=p.lastIndexOf('/'); String nameOnly=(slash>=0)?p.substring(slash+1):p;
+    if(isD){
+      if(isThumbDirPath(p)) { f=d.openNextFile(); continue; }
+      out.push_back({nameOnly,p,true,0,counter++});
+    } else {
+      if(isSupportedFile(p)){
+        out.push_back({nameOnly,p,false,(uint64_t)f.size(),counter++});
+        totalSize+=f.size();
+        fileCount+=1;
+      }
+    }
+    f=d.openNextFile(); heartbeat();
+  }
+}
+
+static String sortLink(const String& dir, const String& by, const String& curSort, const String& curOrder){
+  String order="asc"; if(curSort==by && curOrder=="asc") order="desc";
+  return "/?dir="+urlEncode(dir)+"&sort="+by+"&order="+order;
+}
+
+// ===== USB present toggle =====
+static void setUsbPresented(bool present){
+  g_mscPresented = present;
+  if (present){
+    MSC.mediaPresent(true);
+  } else {
+    MSC.mediaPresent(false);
+    g_usbMounted = false;
+  }
+}
+
+static void handleUsbToggle(){
+  String cmd = server.hasArg("cmd") ? server.arg("cmd") : "";
+  String dir = sanitizeDir(server.hasArg("dir") ? urlDecodeMin(server.arg("dir")) : String(STL_DIR));
+  String sort=server.hasArg("sort")? server.arg("sort"): "name";
+  String order=server.hasArg("order")? server.arg("order"): "asc";
+  String theme=server.hasArg("theme")? server.arg("theme"): "dark";
+
+  if (cmd == "present")      setUsbPresented(true);
+  else if (cmd == "websafe") setUsbPresented(false);
+
+  server.sendHeader("Location","/?dir="+urlEncode(dir)+"&sort="+sort+"&order="+order+"&theme="+theme);
+  server.send(303);
+}
+
+
+// ===== Printer page (no UART wiring) =====
+// What we can do without TX/RX:
+//  - Manage files on the same SD that is presented as a USB drive to the printer
+//  - Optionally mirror a selected CTB into /printer/<name>.ctb for easier browsing
+//  - Toggle "USB presented" and optionally force a media re-enumeration (rescan)
+//
+// What we CANNOT do without TX/RX or other hardware mods:
+//  - Start/stop/pause prints, read status, temperatures, progress, etc.
+
+static void handlePrinter(){
+  String theme=server.hasArg("theme")? server.arg("theme"): "dark";
+  bool dark=(theme!="light");
+
+  String s = htmlHeader("Printer", dark);
+  s += "<div class='panel'>"
+       "<div style='display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap'>"
+       "<div><b>Elegoo Mars 3 (USB file workflow)</b></div>"
+       "<div><a class='btn' href='javascript:history.back()'>Back</a></div>"
+       "</div>";
+
+  s += "<div style='margin-top:10px' class='row'>";
+  if (usbExclusiveMode()){
+    s += "<span class='chip' style='color:#ff6a6a'>USB PRESENTED to printer/PC</span>";
+    s += "<a class='btn good' href='/usb?cmd=websafe&dir="+urlEncode(String(CTB_DIR))+"&theme="+(dark?"dark":"light")+"'>Switch to Web-Safe (RW)</a>";
+    s += "<button class='btn blue' type='button' onclick='rescan()'>Force Rescan</button>";
+  } else {
+    s += "<span class='chip' style='color:#76ffb0'>Web-Safe (RW) — USB NOT presented</span>";
+    s += "<a class='btn blue' href='/usb?cmd=present&dir="+urlEncode(String(CTB_DIR))+"&theme="+(dark?"dark":"light")+"'>Present USB to printer</a>";
+  }
+  s += "</div>";
+
+  s += "<div style='margin-top:10px;color:var(--sub)'>"
+       "This hub can manage and copy CTB files on the SD card that the printer sees as a USB drive. "
+       "Without TX/RX wiring, it cannot start/stop a print or read printer status.</div>";
+
+  // List files in /ctb and /printer
+  auto listSimple = [&](const char* title, const char* dirPath){
+    s += "<div style='margin-top:14px'><b>"+String(title)+"</b> <span class='chip'>"+String(dirPath)+"</span></div>";
+    fs::File d = SD.open(dirPath);
+    if (!d || !d.isDirectory()){
+      s += "<div style='color:var(--sub);margin-top:6px'>Missing folder.</div>";
+      return;
+    }
+    s += "<div class='panel' style='margin-top:8px'><table>";
+    s += "<tr><th>Preview</th><th>Name</th><th>Size</th><th>Actions</th></tr>";
+    fs::File f = d.openNextFile();
+    while (f){
+      if (!f.isDirectory()){
+        String p = f.name();
+        String nameOnly = baseNameOnly(p);
+        String lo = nameOnly; lo.toLowerCase();
+        if (lo.endsWith(".ctb")){
+          s += "<tr>";
+          s += "<td><img class=\"thumb\" loading=\"lazy\" src=\"/thumb?name="+urlEncode(p)+"&v=1\"/></td>";
+          s += "<td>"+htmlEscape(nameOnly)+"</td>";
+          s += "<td>"+htmlEscape(humanSize((uint64_t)f.size()))+"</td>";
+          s += "<td>";
+          s += "<a class='btn' href='/download?name="+urlEncode(p)+"'>Download</a> ";
+          s += "<a class='btn blue' href='/view?name="+urlEncode(p)+"'>Preview</a> ";
+          if (!usbExclusiveMode()){
+            if (String(dirPath) == String(CTB_DIR)){
+              s += "<a class='btn good' href='/printer/send?name="+urlEncode(p)+"'>Mirror to "+String(PRINTER_DIR)+"</a> ";
+            } else if (String(dirPath) == String(PRINTER_DIR)){
+              s += "<a class='btn red' href='/delete?name="+urlEncode(p)+"&dir="+urlEncode(String(PRINTER_DIR))+"'>Delete</a> ";
+            }
+          } else {
+            s += "<span class='chip'>Read-only</span>";
+          }
+          s += "</td></tr>";
+        }
+      }
+      f = d.openNextFile();
+      heartbeat();
+    }
+    s += "</table></div>";
+  };
+
+  listSimple("CTB Library", CTB_DIR);
+  listSimple("Mirrored for printer", PRINTER_DIR);
+
+  s += R"JS(
+<script>
+async function rescan(){
+  if(!confirm("Force rescan will temporarily disconnect/reconnect USB media. Do NOT do this while a print is running. Continue?")) return;
+  try{
+    const r = await fetch("/printer/rescan", {cache:"no-store"});
+    const j = await r.json();
+    alert(j && j.ok ? "Rescan triggered." : "Rescan failed.");
+  }catch(e){ alert("Rescan failed."); }
+}
+</script>
+)JS";
+
+  s += htmlFooter();
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+static void handlePrinterSend(){
+  if (usbExclusiveMode()){
+    server.send(423, "text/plain", "USB presented; web is read-only. Switch to Web-Safe mode first.");
+    return;
+  }
+  String src = ensureAllowedFilePathFromArg("name");
+  if (!src.length() || !SD.exists(src)){
+    server.send(404, "text/plain", "Source not found");
+    return;
+  }
+  String lo = src; lo.toLowerCase();
+  if (!lo.endsWith(".ctb")){
+    server.send(415, "text/plain", "Only .ctb supported for printer mirror");
+    return;
+  }
+
+  ensureDir(PRINTER_DIR);
+  String dst = String(PRINTER_DIR) + "/" + baseNameOnly(src);
+
+  bool ok = copyFileBuffered(src, dst);
+
+  // Redirect back to printer page
+  server.sendHeader("Location", String("/printer") + "?ok=" + (ok?"1":"0"));
+  server.send(303);
+}
+
+static void handlePrinterRescan(){
+  // Best-effort: toggle mediaPresent off then on.
+  // WARNING: can corrupt if host is actively using the media.
+  if (!usbExclusiveMode()){
+    server.send(409, "application/json", "{\"ok\":false,\"msg\":\"USB not presented\"}");
+    return;
+  }
+  MSC.mediaPresent(false);
+  delay(300);
+  MSC.mediaPresent(true);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ===== Root page =====
+static void handleRoot(){
+  String dir=sanitizeDir(server.hasArg("dir")? urlDecodeMin(server.arg("dir")): String(STL_DIR));
+  String sort=server.hasArg("sort")? server.arg("sort"): "name";
+  String order=server.hasArg("order")? server.arg("order"): "asc";
+  String theme=server.hasArg("theme")? server.arg("theme"): "dark"; bool dark=(theme!="light");
+
+  std::vector<Item> items; items.reserve(256);
+  uint64_t totalSize=0; uint32_t fileCount=0; uint32_t counter=1;
+  listDirItems(dir, items, counter, totalSize, fileCount);
+
+  auto cmp=[&](const Item& a,const Item& b){
+    if(a.isDir!=b.isDir) return a.isDir>b.isDir;
+    int sgn=0;
+    if(sort=="size") sgn=(a.size<b.size)?-1:((a.size>b.size)?1:0);
+    else if(sort=="date") sgn=(a.pseudoTime<b.pseudoTime)?-1:((a.pseudoTime>b.pseudoTime)?1:0);
+    else sgn=ciCmp(a.name, b.name);
+    return (order=="asc")?(sgn<0):(sgn>0);
+  };
+  std::sort(items.begin(), items.end(), cmp);
+
+  uint64_t card=0;
+  #if ARDUINO_ARCH_ESP32
+    card = SD.cardSize();
+  #endif
+  uint64_t used=totalSize; uint64_t freeB=(card>used)?(card-used):0;
+
+  String s=htmlHeader("ESP32-S3 FileHub", dark);
+  IPAddress ip=(WiFi.getMode()==WIFI_MODE_STA)?WiFi.localIP():WiFi.softAPIP();
+
+  s += "<div class='top row'>"
+       "<div><b>ESP32-S3 SD FileHub</b> "
+       "<span class='chip'>IP: "+ip.toString()+"</span> "
+       "<span class='chip'>Used: "+htmlEscape(humanSize(used))+"</span> "
+       "<span class='chip'>Free: "+htmlEscape(humanSize(freeB))+"</span> "
+       "<span class='chip'>Total: "+htmlEscape(humanSize(card))+"</span>"
+       "</div>"
+       "<div class='row'><span class='chip' id='qst'>Queue: idle</span></div></div>";
+
+  // USB/Web safety panel + button
+  s += "<div class='panel row'>";
+  if (usbExclusiveMode()){
+    s += "<div style='flex:1;min-width:260px'>"
+         "<b style='color:#ff6a6a'>USB mode: PRESENTED to Printer/PC</b><br>"
+         "<span style='color:#9db1c7'>Safe use: Use the SD drive on your PC. The web UI is read-only (no upload/delete/thumb-gen) to reduce corruption risk.</span>"
+         "</div>";
+    s += "<div>"
+         "<a class='btn good' href='/usb?cmd=websafe&dir="+urlEncode(dir)+"&sort="+sort+"&order="+order+"&theme="+(dark?"dark":"light")+"'>Switch to Web-Safe (RW)</a>"
+         "</div>";
+  } else {
+    s += "<div style='flex:1;min-width:260px'>"
+         "<b style='color:#76ffb0'>Web-Safe mode: USB NOT presented</b><br>"
+         "<span style='color:#9db1c7'>Safe use: Use the web UI to upload/delete/generate thumbnails. (PC should not be using the USB drive.)</span>"
+         "</div>";
+    s += "<div>"
+         "<a class='btn blue' href='/usb?cmd=present&dir="+urlEncode(dir)+"&sort="+sort+"&order="+order+"&theme="+(dark?"dark":"light")+"'>Present to Printer/PC</a>"
+         "</div>";
+  }
+  s += "</div><div style='height:10px'></div>";
+
+    // Mars Remote shortcut
+  s += "<div class='panel row'>"
+       "<a class='btn blue' href='/mars?theme="+String(dark?"dark":"light")+"'>Mars Remote</a>"
+       "<span class='chip'>UART control (advanced)</span>"
+       "</div><div style='height:10px'></div>";
+
+// Folder switch
+  s += "<div class='panel row'>"
+       "<a class='btn blue' href='/?dir="+urlEncode(String(STL_DIR))+"&sort="+sort+"&order="+order+"&theme="+(dark?"dark":"light")+"'>STL Folder</a>"
+       "<a class='btn blue' href='/?dir="+urlEncode(String(CTB_DIR))+"&sort="+sort+"&order="+order+"&theme="+(dark?"dark":"light")+"'>CTB Folder</a>"
+       "<a class='btn blue' href='/printer?theme="+(dark?"dark":"light")+"'>Printer</a>"
+       "<span class='chip'>Current: "+htmlEscape(dir)+"</span>"
+       "</div><div style='height:10px'></div>";
+
+  bool ro = usbExclusiveMode();
+  s += "<div class='panel row'>"
+       "<form id='uform' method='POST' action='/upload' enctype='multipart/form-data'>"
+       "<input type='hidden' name='dir' value='"+htmlEscape(dir)+"'>"
+       "<input type='file' name='file' accept='.stl,.ctb' "+String(ro?"disabled":"")+"> "
+       "<input class='btn' type='submit' value='Upload' "+String(ro?"disabled":"")+"></form>"
+       "<div id='progress'><div id='bar'></div></div><div id='status'></div>"
+       "<form id='multi' method='POST'>"
+       "<input type='hidden' name='dir' value='"+htmlEscape(dir)+"'>"
+       "<button class='btn red' formaction='/delete-multi' type='submit' "+String(ro?"disabled":"")+">Delete Selected</button>"
+       "</form>"
+       "<div class='chip'>Files: "+String(fileCount)+"</div>"
+       "<div class='chip'>Total (this view): "+htmlEscape(humanSize(totalSize))+"</div>"
+       "</div>";
+
+  s += "<div class='panel'><table>"
+       "<tr><th></th><th>Preview</th>"
+       "<th><a href='"+sortLink(dir,"name",sort,order)+"'>Name</a></th>"
+       "<th><a href='"+sortLink(dir,"size",sort,order)+"'>Size</a></th>"
+       "<th><a href='"+sortLink(dir,"date",sort,order)+"'>Date</a></th>"
+       "<th>Actions</th></tr>";
+
+  for(const auto& it: items){
+    if(it.isDir){
+      s += "<tr><td></td><td>📁</td>"
+           "<td><a class='folder' href='/?dir="+urlEncode(it.path)+"&sort="+sort+"&order="+order+"&theme="+(dark?"dark":"light")+"'>"+htmlEscape(it.name)+"</a></td>"
+           "<td>—</td><td>—</td><td></td></tr>";
+    }else{
+      String encPath=urlEncode(it.path);
+      String viewUrl="/view?name="+encPath;
+
+      // COMPAT thumb lookup
+      String thumbPath = pngForExistingOrNew(it.path);
+      String encThumb  = urlEncode(thumbPath);
+
+      s += "<tr>";
+      s += "<td><input form='multi' type='checkbox' name='sel' value='"+htmlEscape(it.path)+"' "+String(ro?"disabled":"")+"></td>";
+
+      s += "<td><img class='thumb' loading='lazy' src=\"/thumb?name="+encPath+"&v="+String(it.pseudoTime)+"\"/></td>";
+
+      s += "<td>"+htmlEscape(it.name)+"</td>"
+           "<td>"+htmlEscape(humanSize(it.size))+"</td>"
+           "<td>#"+String(it.pseudoTime)+"</td>"
+           "<td>"
+           "<a class='btn' href='/download?name="+encPath+"'>Download</a> "
+           "<a class='btn blue' href='"+viewUrl+"'>Preview</a> ";
+      if (!ro && hasCTBExt(it.path)){
+        s += "<a class='btn good' href='/printer/send?name="+encPath+"'>Send to Printer</a> ";
+      }
+
+      if (!ro){
+        s += "<a class='btn red' href='/delete?name="+encPath+"&dir="+urlEncode(dir)+"'>Delete</a> ";
+      } else {
+        s += "<span class='chip'>Read-only</span> ";
+      }
+
+      s += "</td></tr>";
+    }
+  }
+  s += "</table></div>";
+
+  s += R"JS(
+<script>
+const form=document.getElementById('uform'),st=document.getElementById('status'),pg=document.getElementById('progress'),bar=document.getElementById('bar');
+if(form){
+  form.addEventListener('submit',e=>{
+    e.preventDefault();
+    const fi=form.querySelector('input[type=file]'); if(!fi || !fi.files.length){st.textContent='No file';return;}
+    const d=new FormData(form); st.textContent='Uploading...'; pg.style.display='block'; bar.style.width='0%';
+    const x=new XMLHttpRequest(); x.open('POST','/upload',true);
+    x.upload.onprogress=e=>{ if(e.lengthComputable) bar.style.width=(e.loaded/e.total*100).toFixed(1)+'%'; };
+    x.onload=()=>{ if(x.status==200){ st.textContent='✅ Upload complete'; setTimeout(()=>location.reload(), 350); } else st.textContent='❌ Upload failed: '+x.responseText; };
+    x.onerror=()=>{ st.textContent='❌ Network error'; };
+    x.send(d);
+  });
+}
+let _prevBusy=false;
+setInterval(async()=>{
+  try{
+    const r=await fetch('/qstate'); const j=await r.json();
+    const q=document.getElementById('qst');
+    if(j.busy){
+      const fname=decodeURIComponent(j.file||"");
+      q.textContent=(fname? (fname+" — ") : "") + (j.task||"Working")+" "+((j.progress|0))+"%";
+      if(st) st.textContent=(j.task? (j.task+": "):"")+(j.file||"")+(j.progress?(" ("+(j.progress|0)+"%)"):"");
+      if(pg) pg.style.display='block';
+      if(bar && typeof j.progress==='number'){ bar.style.width=(j.progress|0)+'%'; }
+      _prevBusy=true;
+    }else{
+      q.textContent=j.usbPresented ? 'Queue: idle • Printer/PC presented (web read-only)' : 'Queue: idle • Web-safe RW';
+      if(_prevBusy){ location.reload(); } _prevBusy=false;
+      if(bar) bar.style.width='0%'; if(pg) pg.style.display='none';
+    }
+  }catch(e){}
+}, 900);
+</script>
+)JS";
+
+  s += htmlFooter();
+  server.send(200,"text/html; charset=utf-8",s);
+}
+
+// ===== File serving & actions =====
+static void handleFile(){
+  String n = server.hasArg("name")? urlDecodeMin(server.arg("name")): String();
+  if(!n.length()){ server.send(400,"text/plain","Bad request"); return; }
+  n=ensureSlash(n);
+  if(!SD.exists(n)){ server.send(404,"text/plain","Not found"); return; }
+
+  fs::File f=SD.open(n, FILE_READ);
+  String lower=n; lower.toLowerCase();
+
+  String ctype="application/octet-stream";
+  if(lower.endsWith(".png")) {
+    ctype="image/png";
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+  }
+
+  server.streamFile(f,ctype);
+  f.close();
+}
+
+static void handleDownload(){
+  String n=ensureAllowedFilePathFromArg("name");
+  if(!n.length()||!SD.exists(n)){ server.send(404,"text/plain","Not found"); return; }
+  fs::File f=SD.open(n, FILE_READ);
+  String fn=f.name(); if(fn.startsWith("/")) fn.remove(0,1);
+  server.sendHeader("Content-Disposition","attachment; filename=\""+fn+"\"");
+  server.streamFile(f,"application/octet-stream"); f.close();
+}
+
+static void handleDelete(){
+  if (usbExclusiveMode()) { server.send(423,"text/plain","USB presented to PC (web is read-only). Switch to Web-Safe mode first."); return; }
+  String n=ensureAllowedFilePathFromArg("name");
+  String dir=sanitizeDir(server.hasArg("dir")? urlDecodeMin(server.arg("dir")): String(STL_DIR));
+  if(n.length()&&SD.exists(n)) SD.remove(n);
+
+  // Delete both old + new thumb names (compat)
+  deleteThumbForFileBoth(n);
+
+  server.sendHeader("Location","/?dir="+urlEncode(dir)); server.send(303);
+}
+
+static void handleDeleteMulti(){
+  if (usbExclusiveMode()) { server.send(423,"text/plain","USB presented to PC (web is read-only). Switch to Web-Safe mode first."); return; }
+  String dir=sanitizeDir(server.hasArg("dir")? urlDecodeMin(server.arg("dir")): String(STL_DIR));
+  int n=server.args();
+  for(int i=0;i<n;i++){
+    if(server.argName(i)!="sel") continue;
+    String p=ensureSlash(urlDecodeMin(server.arg(i)));
+    p.replace("..",""); while (p.indexOf("//")>=0) p.replace("//","/");
+    if(!isBaseDirAllowed(p)){
+      if (hasCTBExt(p)) p=joinPath(String(CTB_DIR), p[0]=='/'? p.substring(1):p);
+      else              p=joinPath(String(STL_DIR), p[0]=='/'? p.substring(1):p);
+    }
+    if(SD.exists(p)) SD.remove(p);
+    deleteThumbForFileBoth(p);
+  }
+  server.sendHeader("Location","/?dir="+urlEncode(dir)); server.send(303);
+}
+
+// ===== Upload =====
+static volatile bool g_uploadOK = false;
+
+static void handleFileUpload(){
+  if (usbExclusiveMode()) { return; }
+  static fs::File f; static String lastName; static String uploadDir;
+  HTTPUpload &u=server.upload();
+  switch(u.status){
+    case UPLOAD_FILE_START:{
+      g_uploadOK=false;
+      if(f) f.close();
+      uploadDir = sanitizeDir(server.hasArg("dir") ? urlDecodeMin(server.arg("dir")) : String(STL_DIR));
+
+      String fn = u.filename;
+      String lo = fn; lo.toLowerCase();
+      if (lo.endsWith(".ctb")) uploadDir = String(CTB_DIR);
+      else if (lo.endsWith(".stl")) uploadDir = String(STL_DIR);
+
+      lastName = joinPath(uploadDir, u.filename);
+      if(SD.exists(lastName)) SD.remove(lastName);
+      f = SD.open(lastName, FILE_WRITE);
+      break;
+    }
+    case UPLOAD_FILE_WRITE:
+      if(f) f.write(u.buf, u.currentSize);
+      break;
+    case UPLOAD_FILE_END:
+      if(f) f.close();
+      if(isSupportedFile(lastName)){
+        qEnqueue(lastName);
+        g_busy = true;
+        setStatus("Waiting in queue", lastName, 0);
+      }
+      g_uploadOK = true;
+      break;
+    case UPLOAD_FILE_ABORTED:
+      if(f){ f.close(); if(lastName.length()) SD.remove(lastName); }
+      g_uploadOK=false;
+      break;
+    default: break;
+  }
+}
+
+static void handleUploadDone(){
+  if (usbExclusiveMode()) { server.send(423,"text/plain","USB presented to PC (web is read-only). Switch to Web-Safe mode first."); return; }
+  if(g_uploadOK) server.send(200,"text/plain","OK");
+  else           server.send(500,"text/plain","ABORTED");
+}
+
+// ===== /thumb to rebuild a thumb (manual) =====
+static void handleThumb(){
+  // Two modes:
+  //  - default: serve the thumbnail image (and generate it on-demand if missing)
+  //  - q=1    : enqueue thumbnail generation (legacy behavior for the UI action link)
+  const bool queueOnly = server.hasArg("q");
+
+  String filePath = ensureAllowedFilePathFromArg("name");
+  if (!filePath.length()) return; // ensureAllowedFilePathFromArg already responded with an error
+
+  if (queueOnly) {
+    if (usbExclusiveMode()) {
+      server.send(423, "text/plain", "USB is presented; web is read-only. Disable USB presentation to generate thumbnails.");
+      return;
+    }
+    thumbgenEnqueue(filePath);
+    server.send(200, "application/json", "{\"queued\":true}");
+    return;
+  }
+
+  // Image mode: compute where the thumb should live
+  String thumbPath = pngForExistingOrNew(filePath);
+
+  // Generate if missing (only when web is in RW mode)
+  if (!SD.exists(thumbPath)) {
+    if (!usbExclusiveMode()) {
+      bool ok = false;
+
+      if (hasExt(filePath, ".stl")) {
+        ok = generateThumbSTL(filePath.c_str(), thumbPath.c_str());
+      } else if (hasExt(filePath, ".ctb")) {
+        ok = generateThumbCTB_RealPreview_Auto(filePath.c_str(), thumbPath);
+      } else {
+        // unsupported for thumbnails
+        ok = false;
+      }
+
+      if (ok) {
+        thumbPath = pngForExistingOrNew(filePath);
+      }
+    }
+  }
+
+  if (SD.exists(thumbPath)) {
+    File f = SD.open(thumbPath, FILE_READ);
+    if (!f) {
+      server.send(500, "text/plain", "failed to open thumbnail");
+      return;
+    }
+    // Thumbnails generated by this firmware are PNGs.
+    server.streamFile(f, "image/png");
+    f.close();
+    return;
+  }
+
+  server.send(404, "text/plain", "thumbnail not found");
+}
+
+// ===== /view endpoint for both STL and CTB =====
+static void handleView(){
+  String n=ensureAllowedFilePathFromArg("name");
+  if(!n.length()||!SD.exists(n)){ server.send(404,"text/plain","Not found"); return; }
+
+  if (hasSTLExt(n)){
+    String s=htmlHeader("Preview", true);
+    s += "<div class='panel'><div style='display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap'>"
+         "<div><b>Preview (STL):</b> "+htmlEscape(n)+"</div>"
+         "<div>"
+         "<a class='btn' href='javascript:history.back()'>Back</a> <a class='btn' href='/download?name="+urlEncode(n)+"'>Download STL</a>"
+         "</div>"
+         "</div>"
+         "<canvas id='cv' style='width:100%;height:70vh;border:1px solid #1e2632;background:#0e131b;border-radius:12px'></canvas>"
+         "<div style='margin-top:8px;color:#9db1c7'>Drag to rotate • Wheel to zoom • Double-click to reset</div>"
+         "</div>";
+    s += "<script src='/stlview.js'></script>\n";
+    s += "<script>initSTLViewer('cv', \"/file?name="+urlEncode(n)+"\");</script>";
+    s += htmlFooter();
+    server.send(200,"text/html; charset=utf-8",s);
+    return;
+  }
+
+  if (hasCTBExt(n)){
+    // COMPAT lookup: show legacy thumb if it exists
+    String thumb = pngForExistingOrNew(n);
+
+    // If neither exists, queue generation
+    if (!SD.exists(thumb) && !usbExclusiveMode()){
+      qEnqueue(n);
+      // After queuing, prefer new path for future
+      thumb = pngForNew(n);
+    }
+
+    String s=htmlHeader("Preview", true);
+    s += "<div class='panel'>"
+         "<div style='display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap'>"
+         "<div><b>Preview (CTB):</b> "+htmlEscape(n)+"</div>"
+         "<div>"
+         "<a class='btn' href='javascript:history.back()'>Back</a> <a class='btn' href='/download?name="+urlEncode(n)+"'>Download CTB</a> ";
+    if (!usbExclusiveMode()){
+      s += "<button class='btn blue' type='button' onclick='rebuildThumb(\""+urlEncode(n)+"\",\""+urlEncode(thumb)+"\")'>Rebuild Thumb</button>";
+    } else {
+      s += "<span class='chip'>Read-only</span>";
+    }
+    s += "</div></div>";
+
+    if (SD.exists(thumb)){
+      s += "<div style='margin-top:10px'><img class='thumb' style='width:320px;height:240px' src='/file?name="+urlEncode(thumb)+"'/></div>";
+    } else {
+      s += "<div style='margin-top:10px;color:#9db1c7'>Thumbnail is missing";
+      if (usbExclusiveMode()) s += " (USB presented → web read-only).";
+      else s += " — queued for generation, refresh in a moment.";
+      s += "</div>";
+    }
+
+    s += "<div style='margin-top:10px;color:#9db1c7'>CTB thumbnails are decoded from the embedded 400×300 small preview when present.</div>";
+    s += "</div>";
+    s += htmlFooter();
+    server.send(200,"text/html; charset=utf-8",s);
+    return;
+  }
+
+  server.send(415,"text/plain","Unsupported file type");
+}
+
+// ===== /qstate =====
+static void handleQState(){
+  String js = "{\"busy\":";
+  js += (g_busy?"true":"false");
+  js += ",\"file\":\""; js += urlEncode(g_file); js += "\"";
+  js += ",\"task\":\""; js += g_task; js += "\"";
+  js += ",\"progress\":"; js += String(g_prog);
+  js += ",\"status\":\""; js += urlEncode(g_statusLine); js += "\"";
+  js += ",\"usbMounted\":"; js += (g_usbMounted?"true":"false");
+  js += ",\"usbPresented\":"; js += (g_mscPresented?"true":"false");
+  js += "}";
+  server.send(200,"application/json", js);
+}
+
+
+// ===== Mars Remote control (UART bridge) =====
+static void marsEnsureStarted(){
+  if (g_marsEnabled) return;
+  MarsSerial.begin(MARS_UART_BAUD, SERIAL_8N1, MARS_UART_RX, MARS_UART_TX);
+  g_marsEnabled = true;
+}
+
+static String marsReadResponse(uint32_t timeoutMs){
+  String out;
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs){
+    while (MarsSerial.available()){
+      char c = (char)MarsSerial.read();
+      if (c == '\r') continue;
+      out += c;
+      // keep it bounded
+      if (out.length() > 4096) { return out; }
+    }
+    heartbeat();
+  }
+  out.trim();
+  return out;
+}
+
+static String marsSendLineAndRead(const String& line, uint32_t timeoutMs){
+  marsEnsureStarted();
+  // flush any stale bytes
+  while (MarsSerial.available()) MarsSerial.read();
+
+  MarsSerial.print(line);
+  if (!line.endsWith("\n")) MarsSerial.print("\n");
+
+  g_marsLastCmd = line;
+  g_marsLastMs = millis();
+
+  String resp = marsReadResponse(timeoutMs);
+  if (resp.length()) g_marsLastResp = resp;
+  return resp;
+}
+
+static void handleMars(){
+  // Simple UI: raw command send + quick buttons + status poll.
+  // Keep this conservative because printer models/firmware vary.
+  String theme=server.hasArg("theme")? server.arg("theme"): "dark"; bool dark=(theme!="light");
+  String s = htmlHeader("Mars Remote", dark);
+
+  s += "<div class='panel'>"
+       "<div style='display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap'>"
+       "<div><b>Mars Remote</b> <span class='chip'>UART</span></div>"
+       "<div><a class='btn' href='javascript:history.back()'>Back</a></div>"
+       "</div>";
+
+  s += "<div style='margin-top:10px;color:var(--sub)'>"
+       "This page bridges the ESP32-S3 web UI to the printer's TTL UART. "
+       "Mars 3 compatibility is <b>[Unverified]</b>; many ChiTu-based printers accept serial commands similar to those used by community projects like Mariner. "
+       "You must wire the UART on the printer mainboard to ESP32-S3 pins (TX/RX/GND) and share ground. "
+       "If you're not sure where the UART header is on your Mars 3 mainboard, stop and identify it first—incorrect wiring can damage the board."
+       "</div>";
+
+  s += "<div style='margin-top:12px' class='row'>"
+       "<button class='btn blue' type='button' onclick='sendCmd(\"M801\")'>Query Status (M801)</button>"
+       "<button class='btn' type='button' onclick='sendCmd(\"M802\")'>Pause/Resume (M802)</button>"
+       "<button class='btn red' type='button' onclick='sendCmd(\"M803\")'>Stop (M803)</button>"
+       "<span class='chip'>TX="+String(MARS_UART_TX)+" RX="+String(MARS_UART_RX)+" "+String(MARS_UART_BAUD)+" baud</span>"
+       "</div>";
+
+  s += "<div style='margin-top:12px'>"
+       "<div class='row'>"
+       "<input id='cmd' style='flex:1;min-width:240px;padding:10px;border-radius:10px;border:1px solid #1e263255;background:var(--muted);color:var(--text)' placeholder='Type a command (example: M801)'>"
+       "<button class='btn good' type='button' onclick='sendInput()'>Send</button>"
+       "</div>"
+       "</div>";
+
+  s += "<div style='margin-top:12px'>"
+       "<div class='chip'>Last command: <span id='lastcmd'></span></div> "
+       "<div class='chip'>Last update: <span id='lastms'></span></div>"
+       "</div>";
+
+  s += "<pre id='out' style='margin-top:12px;white-space:pre-wrap;background:var(--muted);border:1px solid #1e263244;border-radius:12px;padding:12px;min-height:140px'></pre>";
+
+  s += R"JS(
+<script>
+async function sendCmd(c){
+  const out=document.getElementById('out');
+  out.textContent = "Sending: " + c + " ...";
+  try{
+    const r = await fetch('/mars/send', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'cmd=' + encodeURIComponent(c)
+    });
+    const j = await r.json();
+    out.textContent = (j.ok ? "" : "ERROR: ") + (j.resp || "");
+    await refreshStatus();
+  }catch(e){
+    out.textContent = "ERROR: " + e;
+  }
+}
+function sendInput(){
+  const c = (document.getElementById('cmd').value || "").trim();
+  if(!c) return;
+  sendCmd(c);
+}
+async function refreshStatus(){
+  try{
+    const r = await fetch('/mars/status');
+    const j = await r.json();
+    document.getElementById('lastcmd').textContent = j.lastCmd || "";
+    document.getElementById('lastms').textContent = j.lastAgeMs + " ms ago";
+    if(j.lastResp){
+      // show last response only if output box is empty-ish
+      const out=document.getElementById('out');
+      if(!out.textContent || out.textContent.startsWith("Sending:")){
+        out.textContent = j.lastResp;
+      }
+    }
+  }catch(e){}
+}
+setInterval(refreshStatus, 1500);
+refreshStatus();
+</script>
+)JS";
+
+  s += "</div>";
+  s += htmlFooter();
+  server.send(200, "text/html; charset=utf-8", s);
+}
+
+static void handleMarsSend(){
+  if(!server.hasArg("cmd")){
+    server.send(400, "application/json", "{\"ok\":false,\"resp\":\"missing cmd\"}");
+    return;
+  }
+  String cmd = urlDecodeMin(server.arg("cmd"));
+  cmd.trim();
+  if(!cmd.length()){
+    server.send(400, "application/json", "{\"ok\":false,\"resp\":\"empty cmd\"}");
+    return;
+  }
+
+  // Keep commands bounded
+  if (cmd.length() > 160) cmd = cmd.substring(0,160);
+
+  // Send and read back (best-effort)
+  String resp = marsSendLineAndRead(cmd, 350);
+
+  String js = "{\"ok\":true,\"resp\":\"";
+  // Escape minimal for JSON
+  for (size_t i=0;i<resp.length();i++){
+    char c = resp[i];
+    if (c=='\\') js += "\\\\";
+    else if (c=='\"') js += "\\\"";
+    else if (c=='\n') js += "\\n";
+    else if (c=='\r') {}
+    else js += c;
+  }
+  js += "\"}";
+  server.send(200, "application/json", js);
+}
+
+static void handleMarsStatus(){
+  uint32_t now = millis();
+  uint32_t age = (g_marsLastMs==0)? 0 : (now - g_marsLastMs);
+
+  auto jsonEsc = [](const String& in)->String{
+    String o; o.reserve(in.length()+16);
+    for(size_t i=0;i<in.length();i++){
+      char c=in[i];
+      if(c=='\\') o += "\\\\";
+      else if(c=='\"') o += "\\\"";
+      else if(c=='\n') o += "\\n";
+      else if(c=='\r') {}
+      else o += c;
+      if(o.length()>4096) break;
+    }
+    return o;
+  };
+
+  String js="{\"enabled\":";
+  js += (g_marsEnabled?"true":"false");
+  js += ",\"lastCmd\":\""; js += jsonEsc(g_marsLastCmd); js += "\"";
+  js += ",\"lastResp\":\""; js += jsonEsc(g_marsLastResp); js += "\"";
+  js += ",\"lastAgeMs\":"; js += String(age);
+  js += "}";
+  server.send(200, "application/json", js);
+}
+
+
+// ===== Wi-Fi =====
+static bool setupWiFi(){
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<10000){ delay(250); }
+  if(WiFi.status()==WL_CONNECTED) return true;
+  if(!ENABLE_AP_FALLBACK) return false;
+  WiFi.mode(WIFI_AP);
+  return WiFi.softAP(AP_SSID, AP_PASS);
+}
+
+// ===== USB event =====
+static void onUsbEvent(void* /*arg*/, esp_event_base_t event_base, int32_t event_id, void* /*event_data*/){
+  if (event_base != ARDUINO_USB_EVENTS) return;
+  if (event_id == ARDUINO_USB_STARTED_EVENT){
+    g_usbAttached = true;
+  } else if (event_id == ARDUINO_USB_STOPPED_EVENT){
+    g_usbAttached = false;
+    g_usbMounted  = false;
+  }
+}
+
+// ===== USB MSC callbacks (ESP32 core 3.3.5 signatures) =====
+static int32_t mscReadCallback(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize){
+  const uint32_t secSize = SD.sectorSize();
+  if (secSize == 0) return -1;
+  uint8_t* dst = (uint8_t*)buffer;
+
+  if ((offset == 0) && (bufsize % secSize == 0)){
+    uint32_t count = bufsize / secSize;
+    for (uint32_t i=0;i<count;i++){
+      if (!SD.readRAW(dst + i*secSize, lba + i)) return -1;
+    }
+    return (int32_t)bufsize;
+  }
+
+  static uint8_t tmp[512];
+  if (secSize > sizeof(tmp)) return -1;
+
+  uint32_t remaining = bufsize;
+  uint32_t curLba = lba;
+  uint32_t curOff = offset;
+  while (remaining){
+    if (!SD.readRAW(tmp, curLba)) return -1;
+    uint32_t take = min(remaining, secSize - curOff);
+    memcpy(dst, tmp + curOff, take);
+    dst += take;
+    remaining -= take;
+    curLba++;
+    curOff = 0;
+  }
+  return (int32_t)bufsize;
+}
+
+static int32_t mscWriteCallback(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize){
+  const uint32_t secSize = SD.sectorSize();
+  if (secSize == 0) return -1;
+  g_usbMounted = true;
+
+  if ((offset == 0) && (bufsize % secSize == 0)){
+    uint32_t count = bufsize / secSize;
+    for (uint32_t i=0;i<count;i++){
+      if (!SD.writeRAW(buffer + i*secSize, lba + i)) return -1;
+    }
+    return (int32_t)bufsize;
+  }
+
+  static uint8_t tmp[512];
+  if (secSize > sizeof(tmp)) return -1;
+
+  uint32_t remaining = bufsize;
+  uint32_t curLba = lba;
+  uint32_t curOff = offset;
+  uint8_t* src = buffer;
+
+  while (remaining){
+    if (!SD.readRAW(tmp, curLba)) return -1;
+    uint32_t put = min(remaining, secSize - curOff);
+    memcpy(tmp + curOff, src, put);
+    if (!SD.writeRAW(tmp, curLba)) return -1;
+
+    src += put;
+    remaining -= put;
+    curLba++;
+    curOff = 0;
+  }
+  return (int32_t)bufsize;
+}
+
+static bool mscStartStopCallback(uint8_t /*power_condition*/, bool start, bool load_eject){
+  if (load_eject) { g_usbMounted = false; return true; }
+  g_usbMounted = start ? true : false;
+  return true;
+}
+
+static bool setupUSBMSC(){
+  uint32_t secSize = SD.sectorSize();
+  uint32_t numSecs = SD.numSectors();
+
+  if (secSize == 0 || numSecs == 0){
+    Serial.println("USB MSC: SD sector info unavailable (sectorSize/numSectors == 0)");
+    return false;
+  }
+
+  MSC.vendorID("KeyPunch");
+  MSC.productID("S3-FileHub");
+  MSC.productRevision("1.3");
+
+  MSC.onRead(mscReadCallback);
+  MSC.onWrite(mscWriteCallback);
+  MSC.onStartStop(mscStartStopCallback);
+
+  USB.onEvent(onUsbEvent);
+  USB.begin();
+
+  if (!MSC.begin(numSecs, secSize)){
+    Serial.println("USB MSC: MSC.begin failed");
+    return false;
+  }
+
+  g_mscPresented = START_USB_PRESENTED;
+  MSC.mediaPresent(g_mscPresented);
+
+  Serial.printf("USB MSC: online. Sectors=%lu  SectorSize=%lu  Capacity=%.2f GB\n",
+                (unsigned long)numSecs, (unsigned long)secSize,
+                (double)numSecs*(double)secSize/1073741824.0);
+  return true;
+}
+
+// ===== Setup / Loop =====
+void setup(){
+  Serial.begin(115200); delay(300);
+  Serial.println("ESP32-S3 FileHub — STL + CTB thumbs + Preview + USB toggle");
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if(SD.begin(SD_CS, SPI, 10000000)) Serial.println("SD init OK");
+  else Serial.println("SD init FAIL");
+
+  ensureDir(STL_DIR);
+  ensureDir(CTB_DIR);
+  ensureDir(PRINTER_DIR);
+  ensureThumbDirs();
+
+  bool usbOk = false;
+  if (SD.cardSize() > 0) {
+    usbOk = setupUSBMSC();
+  } else {
+    Serial.println("USB MSC: skipped (SD not ready)");
+  }
+
+  if (!usbOk) {
+    g_mscPresented = false;
+  }
+
+  if(setupWiFi()){
+    Serial.print("WiFi IP: ");
+    Serial.println((WiFi.getMode()==WIFI_MODE_STA)?WiFi.localIP():WiFi.softAPIP());
+  } else Serial.println("WiFi setup failed");
+
+  server.on("/", handleRoot);
+  server.on("/file", handleFile);
+  server.on("/download", handleDownload);
+  server.on("/delete", handleDelete);
+  server.on("/delete-multi", HTTP_POST, handleDeleteMulti);
+  server.on("/upload", HTTP_POST, handleUploadDone, handleFileUpload);
+  server.on("/thumb", handleThumb);
+  server.on("/printer", handlePrinter);
+  server.on("/printer/send", handlePrinterSend);
+  server.on("/printer/rescan", handlePrinterRescan);
+
+
+  server.on("/view", handleView);
+  server.on("/stlview.js", handleStlViewJs);
+
+  server.on("/usb", handleUsbToggle);
+  server.on("/mars", handleMars);
+  server.on("/mars/send", HTTP_POST, handleMarsSend);
+  server.on("/mars/status", handleMarsStatus);
+
+  server.on("/qstate", handleQState);
+  server.on("/favicon.ico", [](){ server.send(204); });
+
+  server.begin();
+  Serial.println("HTTP server started.");
+
+  if(REBUILD_THUMBS_ON_BOOT){
+    Serial.println("Rebuilding thumbnails: wiping /thumbs/stl and /thumbs/ctb and re-queuing all supported files...");
+    wipeThumbs();
+  }
+
+  scanDirAndQueueMissing(String(STL_DIR));
+  scanDirAndQueueMissing(String(CTB_DIR));
+}
+
+void loop(){
+  server.handleClient();
+
+  if (usbExclusiveMode()) {
+    delay(2);
+    return;
+  }
+
+  static uint32_t lastRun=0;
+  if(!qIsEmpty() && !g_qbusy && millis()-lastRun>20){
+    g_qbusy=true;
+    String n=qDequeue();
+    g_file=n; g_busy=true; g_task="Preparing"; g_prog=0;
+    lastRun=millis();
+
+    if(n.length()){
+      (void)generateThumbAny(n);
+    }
+
+    g_busy=false; g_task=""; g_file=""; g_prog=0; g_statusLine="";
+    g_qbusy=false; delay(3);
+  }
+  delay(1);
+}

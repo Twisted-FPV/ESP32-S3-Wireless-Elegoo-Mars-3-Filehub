@@ -1393,7 +1393,7 @@ static void handleStlViewJs(){
 
     function draw(mesh){
       resize(); ensureZbuf();
-      ctx.fillStyle = "#0e131b";
+      ctx.fillStyle = "#f2f4f7";
       ctx.fillRect(0,0,canvas.width,canvas.height);
 
       const W=canvas.width, H=canvas.height;
@@ -1931,6 +1931,7 @@ static void handleView(){
     s += "<div class='panel'><div style='display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap'>"
          "<div><b>Preview (STL):</b> "+htmlEscape(n)+"</div>"
          "<div>"
+         "<a class='btn' href='javascript:history.back()'>Back</a> "
          "<a class='btn' href='/download?name="+urlEncode(n)+"'>Download STL</a>"
          "</div>"
          "</div>"
